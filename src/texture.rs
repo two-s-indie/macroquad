@@ -14,7 +14,12 @@ use std::sync::Arc;
 mod slotmap;
 
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) struct TextureSlotGuarded(pub TextureSlotId);
+pub(crate) struct TextureSlotGuarded(
+    pub TextureSlotId,
+    // Keep render-pass attachments alive while a texture handle exists and
+    // let the pass guard arrange their deletion exactly once.
+    Option<Arc<RenderPassGuarded>>,
+);
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TextureHandle {
@@ -27,8 +32,8 @@ pub(crate) enum TextureHandle {
 
 pub(crate) struct TexturesContext {
     textures: TextureIdSlotMap,
-    removed: Vec<TextureSlotId>,
-    removed_render_passes: Vec<miniquad::RenderPass>,
+    removed: Vec<(TextureSlotId, bool)>,
+    removed_render_passes: Vec<(miniquad::RenderPass, Vec<miniquad::TextureId>)>,
 }
 impl TexturesContext {
     pub fn new() -> TexturesContext {
@@ -38,14 +43,31 @@ impl TexturesContext {
             removed_render_passes: Vec::with_capacity(10),
         }
     }
-    fn schedule_removed(&mut self, texture: TextureSlotId) {
-        self.removed.push(texture);
+    fn schedule_removed(&mut self, texture: TextureSlotId, delete_texture: bool) {
+        self.removed.push((texture, delete_texture));
     }
-    fn schedule_render_pass_removed(&mut self, pass: miniquad::RenderPass) {
-        self.removed_render_passes.push(pass);
+    fn schedule_render_pass_removed(
+        &mut self,
+        pass: miniquad::RenderPass,
+        textures: Vec<miniquad::TextureId>,
+    ) {
+        self.removed_render_passes.push((pass, textures));
     }
     fn store_texture(&mut self, texture: miniquad::TextureId) -> TextureHandle {
-        TextureHandle::Managed(Arc::new(TextureSlotGuarded(self.textures.insert(texture))))
+        TextureHandle::Managed(Arc::new(TextureSlotGuarded(
+            self.textures.insert(texture),
+            None,
+        )))
+    }
+    fn store_render_target_texture(
+        &mut self,
+        texture: miniquad::TextureId,
+        pass: Arc<RenderPassGuarded>,
+    ) -> TextureHandle {
+        TextureHandle::Managed(Arc::new(TextureSlotGuarded(
+            self.textures.insert(texture),
+            Some(pass),
+        )))
     }
     pub fn texture(&self, texture: TextureSlotId) -> Option<miniquad::TextureId> {
         self.textures.get(texture)
@@ -58,13 +80,18 @@ impl TexturesContext {
     }
     pub fn garbage_collect(&mut self, ctx: &mut miniquad::Context) {
         // Delete RenderPasses first, then textures (safer for attachments/FBOs)
-        for pass in self.removed_render_passes.drain(0..) {
+        for (pass, textures) in self.removed_render_passes.drain(0..) {
             ctx.delete_render_pass(pass);
+            for texture in textures {
+                ctx.delete_texture(texture);
+            }
         }
 
-        for texture in self.removed.drain(0..) {
-            if let Some(texture) = self.textures.get(texture) {
-                ctx.delete_texture(texture);
+        for (texture, delete_texture) in self.removed.drain(0..) {
+            if delete_texture {
+                if let Some(texture) = self.textures.get(texture) {
+                    ctx.delete_texture(texture);
+                }
             }
             self.textures.remove(texture);
         }
@@ -355,7 +382,18 @@ pub async fn load_texture(path: &str) -> Result<Texture2D, Error> {
 pub struct RenderPass {
     pub color_texture: Texture2D,
     pub depth_texture: Option<Texture2D>,
-    pub(crate) render_pass: Arc<miniquad::RenderPass>,
+    pub(crate) render_pass: Arc<RenderPassGuarded>,
+}
+
+#[derive(Debug, PartialEq)]
+pub(crate) struct RenderPassGuarded(miniquad::RenderPass, Vec<miniquad::TextureId>);
+
+impl Drop for RenderPassGuarded {
+    fn drop(&mut self) {
+        get_context()
+            .textures
+            .schedule_render_pass_removed(self.0, std::mem::take(&mut self.1));
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -380,18 +418,7 @@ impl Default for RenderTargetParams {
 impl RenderPass {
     /// Returns the miniquad handle for this render pass.
     pub fn raw_miniquad_id(&self) -> miniquad::RenderPass {
-        *self.render_pass
-    }
-}
-
-impl Drop for RenderPass {
-    fn drop(&mut self) {
-        // Safety: if strong_count < 2, this is the last strong ref.
-        // No new strong references can be created after this point.
-        if Arc::strong_count(&self.render_pass) < 2 {
-            let ctx = get_context();
-            ctx.textures.schedule_render_pass_removed(*self.render_pass);
-        }
+        self.render_pass.0
     }
 }
 
@@ -460,14 +487,28 @@ pub fn render_target_ex(width: u32, height: u32, params: RenderTargetParams) -> 
         texture = color_texture;
     }
 
+    // Miniquad's OpenGL backend deletes attachments with the pass. Metal
+    // releases only the pass descriptor, so its attachments need explicit
+    // deletion after the last pass/texture owner is gone.
+    let mut owned_attachments = Vec::new();
+    if get_quad_context().info().backend == miniquad::Backend::Metal {
+        owned_attachments.push(color_texture);
+        owned_attachments.extend(depth_texture);
+        if texture != color_texture {
+            owned_attachments.push(texture);
+        }
+    }
+    let render_pass = Arc::new(RenderPassGuarded(render_pass, owned_attachments));
     let texture = Texture2D {
-        texture: context.textures.store_texture(texture),
+        texture: context
+            .textures
+            .store_render_target_texture(texture, render_pass.clone()),
     };
 
     let render_pass = RenderPass {
         color_texture: texture.clone(),
         depth_texture: None,
-        render_pass: Arc::new(render_pass),
+        render_pass,
     };
     RenderTarget {
         texture,
@@ -646,7 +687,7 @@ pub struct Texture2D {
 impl Drop for TextureSlotGuarded {
     fn drop(&mut self) {
         let ctx = get_context();
-        ctx.textures.schedule_removed(self.0);
+        ctx.textures.schedule_removed(self.0, self.1.is_none());
     }
 }
 
