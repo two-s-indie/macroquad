@@ -288,6 +288,8 @@ struct Uniform {
 #[derive(Clone)]
 struct PipelineExt {
     pipeline: miniquad::Pipeline,
+    // Built-in pipelines share a shader; custom materials own theirs.
+    owned_shader: Option<ShaderId>,
     wants_screen_texture: bool,
     uniforms: Vec<Uniform>,
     uniforms_data: Vec<u8>,
@@ -525,6 +527,7 @@ impl PipelinesStorage {
 
         self.pipelines[id] = Some(PipelineExt {
             pipeline,
+            owned_shader: None,
             wants_screen_texture,
             uniforms,
             uniforms_data: vec![0; max_offset],
@@ -549,13 +552,20 @@ impl PipelinesStorage {
         self.pipelines[pip.0].as_mut().unwrap()
     }
 
-    fn delete_pipeline(&mut self, pip: GlPipeline) {
-        self.pipelines[pip.0] = None;
+    fn delete_pipeline(&mut self, ctx: &mut dyn RenderingBackend, pip: GlPipeline) {
+        if let Some(pipeline) = self.pipelines[pip.0].take() {
+            ctx.delete_pipeline(pipeline.pipeline);
+            if let Some(shader) = pipeline.owned_shader {
+                ctx.delete_shader(shader);
+            }
+            self.pipelines_amount -= 1;
+        }
     }
 }
 
 pub struct QuadGl {
     pipelines: PipelinesStorage,
+    retired_pipelines: Vec<GlPipeline>,
 
     draw_calls: Vec<DrawCall>,
     draw_calls_bindings: Vec<Bindings>,
@@ -581,6 +591,7 @@ impl QuadGl {
 
         QuadGl {
             pipelines: PipelinesStorage::new(ctx),
+            retired_pipelines: Vec::new(),
             state: GlState {
                 clip: None,
                 viewport: None,
@@ -615,6 +626,7 @@ impl QuadGl {
         uniforms: Vec<UniformDesc>,
         textures: Vec<String>,
     ) -> Result<GlPipeline, Error> {
+        self.collect_retired_pipelines(ctx);
         let mut shader_meta: ShaderMeta = shader::meta();
 
         for uniform in &uniforms {
@@ -641,14 +653,16 @@ impl QuadGl {
         };
         let wants_screen_texture = source.contains("_ScreenTexture");
         let shader = ctx.new_shader(shader, shader_meta)?;
-        Ok(self.pipelines.make_pipeline(
+        let pipeline = self.pipelines.make_pipeline(
             ctx,
             shader,
             params,
             wants_screen_texture,
             uniforms,
             textures,
-        ))
+        );
+        self.pipelines.get_quad_pipeline_mut(pipeline).owned_shader = Some(shader);
+        Ok(pipeline)
     }
 
     pub(crate) fn clear(&mut self, ctx: &mut dyn miniquad::RenderingBackend, color: Color) {
@@ -807,6 +821,7 @@ impl QuadGl {
         self.draw_calls_count = 0;
         self.batch_index_buffer.clear();
         self.batch_vertex_buffer.clear();
+        self.collect_retired_pipelines(ctx);
     }
 
     pub(crate) fn capture(&mut self, capture: bool) {
@@ -969,7 +984,24 @@ impl QuadGl {
     }
 
     pub fn delete_pipeline(&mut self, pipeline: GlPipeline) {
-        self.pipelines.delete_pipeline(pipeline);
+        if self.state.pipeline == Some(pipeline) {
+            self.pipeline(None);
+        }
+        if !self.retired_pipelines.contains(&pipeline) {
+            self.retired_pipelines.push(pipeline);
+        }
+    }
+
+    fn collect_retired_pipelines(&mut self, ctx: &mut dyn RenderingBackend) {
+        let draw_calls = &self.draw_calls[..self.draw_calls_count];
+        let pipelines = &mut self.pipelines;
+        self.retired_pipelines.retain(|pipeline| {
+            if draw_calls.iter().any(|draw| draw.pipeline == *pipeline) {
+                return true;
+            }
+            pipelines.delete_pipeline(ctx, *pipeline);
+            false
+        });
     }
 
     pub fn set_uniform<T>(&mut self, pipeline: GlPipeline, name: &str, uniform: T) {
