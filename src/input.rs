@@ -105,6 +105,8 @@ pub fn touches_local() -> Vec<Touch> {
         .collect()
 }
 
+/// Returns the accumulated horizontal and vertical scroll delta for this frame.
+/// The deltas are reset at the end of each frame.
 pub fn mouse_wheel() -> (f32, f32) {
     let context = get_context();
 
