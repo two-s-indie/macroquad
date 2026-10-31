@@ -4,6 +4,71 @@ pub struct GenerationalId {
     generation: usize,
 }
 
+#[cfg(test)]
+mod tests {
+    use super::GenerationalStorage;
+
+    #[test]
+    fn freeing_a_handle_twice_does_not_duplicate_a_free_slot() {
+        let mut storage = GenerationalStorage::new();
+        let old = storage.push(1);
+        storage.free(old);
+        storage.free(old);
+
+        let first = storage.push(2);
+        let second = storage.push(3);
+        assert_eq!(storage.get(first), Some(&2));
+        assert_eq!(storage.get(second), Some(&3));
+        assert_eq!(storage.count(), 2);
+    }
+
+    #[test]
+    fn cleared_handles_can_be_queried_and_freed() {
+        let mut storage = GenerationalStorage::new();
+        let old = storage.push(1);
+        storage.clear();
+
+        assert!(storage.get(old).is_none());
+        assert!(storage.get_mut(old).is_none());
+        storage.free(old);
+        assert_eq!(storage.count(), 0);
+    }
+
+    #[test]
+    fn clearing_does_not_revive_old_handles_when_slots_are_reused() {
+        let mut storage = GenerationalStorage::new();
+        let old = [storage.push(1), storage.push(2), storage.push(3)];
+        storage.free(old[1]);
+        storage.clear();
+        storage.clear();
+
+        let current = [storage.push(4), storage.push(5), storage.push(6)];
+        for id in old {
+            assert!(storage.get(id).is_none());
+            assert!(storage.get_mut(id).is_none());
+            storage.free(id);
+        }
+        for (id, value) in current.into_iter().zip(4..=6) {
+            assert_eq!(storage.get(id), Some(&value));
+        }
+        assert_eq!(storage.count(), 3);
+    }
+
+    #[test]
+    fn freeing_a_completed_handle_does_not_duplicate_a_free_slot() {
+        let mut storage = GenerationalStorage::new();
+        let completed = storage.push(1);
+        storage.retain(|_| false);
+        storage.free(completed);
+
+        let first = storage.push(2);
+        let second = storage.push(3);
+        storage.free(completed);
+        assert_eq!(storage.get(first), Some(&2));
+        assert_eq!(storage.get(second), Some(&3));
+    }
+}
+
 struct GenerationalCell<T> {
     generation: usize,
     state: T,
@@ -47,11 +112,7 @@ impl<T> GenerationalStorage<T> {
     }
 
     pub fn get(&self, id: GenerationalId) -> Option<&T> {
-        if id.id > self.vec.len() {
-            return None;
-        }
-
-        let cell = self.vec[id.id].as_ref()?;
+        let cell = self.vec.get(id.id)?.as_ref()?;
         if cell.generation != id.generation {
             return None;
         }
@@ -60,11 +121,7 @@ impl<T> GenerationalStorage<T> {
     }
 
     pub fn get_mut(&mut self, id: GenerationalId) -> Option<&mut T> {
-        if id.id > self.vec.len() {
-            return None;
-        }
-
-        let cell = self.vec[id.id].as_mut()?;
+        let cell = self.vec.get_mut(id.id)?.as_mut()?;
         if cell.generation != id.generation {
             return None;
         }
@@ -99,18 +156,14 @@ impl<T> GenerationalStorage<T> {
     }
 
     pub fn clear(&mut self) {
-        self.vec.clear();
-        self.free_indices.clear();
+        // Preserve each slot's generation so clearing cannot revive old handles.
+        self.retain(|_| false);
     }
 
     pub fn free(&mut self, id: GenerationalId) {
-        // an attempt to free a cell by an outdated ID
-        // this is a legit request, no need to panic or anything, just
-        // dont ruin the data that lives there now
-        if let Some(cell) = &self.vec[id.id] {
-            if cell.generation != id.generation {
-                return;
-            }
+        // Finished, stopped, and outdated handles must all be harmless to free.
+        if self.get(id).is_none() {
+            return;
         }
 
         self.free_indices.push((id.id, id.generation));
