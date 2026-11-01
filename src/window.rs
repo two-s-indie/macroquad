@@ -55,29 +55,37 @@ pub unsafe fn get_internal_gl<'a>() -> InternalGlContext<'a> {
     }
 }
 
+/// Logical client width: framebuffer pixels divided by the current rendering DPI scale.
 pub fn screen_width() -> f32 {
     let context = get_context();
     context.screen_width / miniquad::window::dpi_scale()
 }
 
+/// Logical client height: framebuffer pixels divided by the current rendering DPI scale.
 pub fn screen_height() -> f32 {
     let context = get_context();
 
     context.screen_height / miniquad::window::dpi_scale()
 }
 
+/// Current rendering scale supplied by Miniquad. It can change while the window is open.
 pub fn screen_dpi_scale() -> f32 {
     miniquad::window::dpi_scale()
 }
 
-/// Request the window size to be the given value. This takes DPI into account.
+/// Request a client size in logical units. This takes the current DPI into account.
+/// On Windows, round once to the nearest framebuffer pixel before passing the
+/// request to Miniquad. OS constraints can still change the actual client size.
 ///
 /// Note that the OS might decide to give a different size. Additionally, the size in macroquad won't be updated until the next `next_frame().await`.
 pub fn request_new_screen_size(width: f32, height: f32) {
-    miniquad::window::set_window_size(
-        (width * miniquad::window::dpi_scale()) as u32,
-        (height * miniquad::window::dpi_scale()) as u32,
-    );
+    let dpi = miniquad::window::dpi_scale();
+    let (width, height) = (width * dpi, height * dpi);
+    // Match this fork's Windows startup/DPI-transition rounding. Other backends
+    // retain their existing size-request conversion and native sizing contracts.
+    #[cfg(target_os = "windows")]
+    let (width, height) = (width.round(), height.round());
+    miniquad::window::set_window_size(width as u32, height as u32);
     // We do not set the context.screen_width and context.screen_height here.
     // After `set_window_size` is called, EventHandlerFree::resize will be invoked, setting the size correctly.
     // Because the OS might decide to give a different screen dimension, setting the context.screen_* here would be confusing.

@@ -47,7 +47,10 @@ pub fn show_mouse(shown: bool) {
     miniquad::window::show_mouse(shown);
 }
 
-/// Return mouse position in pixels.
+/// Return the mouse position in logical client units, using the current DPI scale.
+/// These units match `screen_width()` and `screen_height()`. While grabbed, the
+/// position is virtual: raw relative motion is accumulated instead of tracking
+/// the operating system cursor.
 pub fn mouse_position() -> (f32, f32) {
     let context = get_context();
 
