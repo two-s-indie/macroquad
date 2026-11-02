@@ -6,8 +6,8 @@ in small, independently verifiable changes.
 
 The latest verified `cargo build` reports five `static_mut_refs` warnings:
 one from `SCENE` and four from `CONTEXT`. The `THREAD_ID`, `STORAGE`, and
-`PROFILER` changes are already implemented. This plan does not change runtime
-code or declare either remaining subsystem safe.
+`PROFILER` changes are already implemented. Step 1 is complete; neither remaining
+subsystem is yet declared safe. The warning count is unchanged.
 
 ## Working rules
 
@@ -33,25 +33,37 @@ Relevant code: [scene.rs](src/experimental/scene.rs),
 
 ### 1 Establish scene behavior and ownership requirements
 
-- [ ] Map node creation, lookup, iteration, deletion, clearing, persistence,
+- [x] Map node creation, lookup, iteration, deletion, clearing, persistence,
   capability access, and `ready`/`update`/`fixed_update`/`draw` callbacks.
-- [ ] Make time inputs explicit where needed so ownership and scheduling tests
+- [x] Make time inputs explicit where needed so ownership and scheduling tests
   can run without constructing a graphics context.
-- [ ] Add focused regression coverage for stale generations, slot reuse,
+- [x] Add focused regression coverage for stale generations, slot reuse,
   simultaneous access to different nodes, conflicting access to one node,
   and additions/deletions during callbacks and iteration.
-- [ ] Establish the intended behavior of `clear()` with live node guards and
+- [x] Establish the intended behavior of `clear()` with live node guards and
   persistent nodes. Failed operations must not leave a partially modified scene.
-- [ ] Audit pointers retained by `RefMut`, `RefMutAny`, and `Lens`: node data,
+- [x] Audit pointers retained by `RefMut`, `RefMutAny`, and `Lens`: node data,
   borrow flags, capability vectors, type-erased callbacks, and arena storage.
   Include allocation alignment, vector relocation, and type validation.
-- [ ] Decide how to identify a scene/session in a handle. `Handle<T>` currently
+- [x] Decide how to identify a scene/session in a handle. `Handle<T>` currently
   implements `Send`; preserve uses required by coroutine APIs while rejecting
   lookup in the wrong scene/thread. Do not silently reinterpret a foreign slot ID.
 
 Acceptance: regression tests describe supported behavior, and the ownership and
 cross-thread handle strategy is recorded before replacing global storage.
 Tests that expose an existing defect become requirements for the next step.
+
+Outcome: [SCENE-OWNERSHIP-AUDIT.md](SCENE-OWNERSHIP-AUDIT.md) records behavior,
+pointer hazards, atomic rejection requirements, stable owned guards, and
+sendable handles with scene/session identity and owner-thread checks. Nine
+headless characterization tests pass; five ignored acceptance tests reproduce
+known defects and all fail when explicitly run. Explicit clock/camera hooks keep
+production ordering. These checks do not establish memory safety. See the audit
+for deferred lens, alignment, callback reentry, and teardown validation.
+Validation: `cargo test --lib` passes 33 tests with those five ignored;
+`cargo build`, `cargo check --all-targets`, formatting, and whitespace checks pass.
+The existing five main-library global-reference warnings and the tiled crate's
+lifetime warning remain. Miri is unavailable; graphics paths were only compiled.
 
 ### 2 Make node guards and field projections retain valid storage
 
@@ -81,8 +93,9 @@ lifetimes. No guard depends on a pointer into a relocatable registry entry.
 - [ ] Refactor scene update into short registry operations and callback dispatch.
   Acquire the node guard and callback information, release the registry borrow,
   invoke user code, then reconcile pending changes.
-- [ ] Preserve callback ordering, fixed-step timing, camera selection, and the
-  existing rules for nodes added or deleted during an update.
+- [ ] Preserve callback ordering, fixed-step timing, and camera selection. Review
+  the audit's early-draw-before-ready behavior and explicitly document any
+  correction to callback eligibility for newly added nodes.
 - [ ] Ensure coroutine cancellation from scene clearing and node destructors
   happens outside scene registry borrows.
 - [ ] Replace `static mut SCENE` and `get_scene() -> &'static mut Scene` with
@@ -223,8 +236,8 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next implementation task is step 1: establish scene behavior and ownership
-requirements. Some preparatory steps will deliberately leave warning counts
+The next implementation task is step 2: make node guards and field projections
+retain valid storage. Some preparatory steps will deliberately leave warning counts
 unchanged until the corresponding global can be replaced safely.
 
 ## Rust reference guidance

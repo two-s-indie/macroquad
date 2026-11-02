@@ -339,6 +339,10 @@ struct Scene {
 
 impl Scene {
     pub fn new() -> Self {
+        Self::new_at(crate::time::get_time())
+    }
+
+    fn new_at(now: f64) -> Self {
         Scene {
             dense: vec![],
             dense_ongoing: vec![],
@@ -348,7 +352,7 @@ impl Scene {
             camera: [Some(Camera2D::default()), None, None, None],
             camera_pos: crate::vec2(0., 0.),
             acc: 0.0,
-            current_time: crate::time::get_time(),
+            current_time: now,
             in_fixed_update: false,
             any_map: std::collections::HashMap::new(),
         }
@@ -478,6 +482,25 @@ impl Scene {
     }
 
     pub fn update(&mut self) {
+        self.update_with(
+            crate::time::get_time,
+            |camera| {
+                crate::prelude::push_camera_state();
+                crate::prelude::set_camera(camera);
+            },
+            crate::prelude::pop_camera_state,
+        );
+    }
+
+    // Keep clock sampling after ready callbacks, as in the production loop.
+    // Explicit clock/camera inputs also allow headless scheduling regression tests.
+    // This does not yet change the global borrowing or callback ownership model.
+    fn update_with(
+        &mut self,
+        clock: impl FnOnce() -> f64,
+        mut push_camera: impl FnMut(&Camera2D),
+        mut pop_camera: impl FnMut(),
+    ) {
         for node in &mut self.iter() {
             let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
             if cell.initialized == false {
@@ -488,7 +511,7 @@ impl Scene {
             }
         }
 
-        let new_time = crate::time::get_time();
+        let new_time = clock();
 
         let mut frame_time = new_time - self.current_time;
 
@@ -525,8 +548,7 @@ impl Scene {
         for camera in self.camera.iter() {
             if let Some(camera) = camera {
                 self.camera_pos = camera.target;
-                crate::prelude::push_camera_state();
-                crate::prelude::set_camera(&*camera);
+                push_camera(camera);
 
                 for node in &mut self.iter() {
                     let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
@@ -534,7 +556,7 @@ impl Scene {
                     unsafe { (*cell.draw)(node) };
                 }
 
-                crate::prelude::pop_camera_state();
+                pop_camera();
             }
         }
 
@@ -682,3 +704,6 @@ pub(crate) fn in_fixed_update() -> bool {
 pub(crate) const fn fixed_frame_time() -> f32 {
     CONST_FPS as _
 }
+
+#[cfg(test)]
+mod tests;

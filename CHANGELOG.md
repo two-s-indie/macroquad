@@ -37,6 +37,11 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Changed
 
+- Establish the scene safety baseline with internal clock/camera inputs for
+  headless tests, preserving production callback ordering and timing. Add nine
+  characterization tests and five ignored acceptance tests reproducing known
+  ownership/identity defects for subsequent migration steps. The remaining
+  scene/context globals and their warnings are unchanged.
 - Update `image` from `0.24` to `0.25`, retaining disabled default features and
   PNG/TGA support. Validated with `0.25.10`, which requires Rust 1.88 or newer.
   Add regression tests for PNG export/reload (including the existing vertical
@@ -53,6 +58,9 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Documentation
 
+- Complete step 1 of the scene/context plan and add `SCENE-OWNERSHIP-AUDIT.md`
+  with behavior, pointer hazards, clear/delete requirements, and the proposed
+  owned-guard and scene/session handle strategy.
 - Add `SCENE-CONTEXT-PLAN.md` with ordered ownership, callback, lifecycle, and
   validation steps for fixing the remaining scene and context globals.
 - Add this changelog covering all 10 existing commits on `game` since its
