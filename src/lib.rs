@@ -156,21 +156,57 @@ use crate::{
 use glam::{vec2, Mat4, Vec2};
 
 pub(crate) mod thread_assert {
-    static mut THREAD_ID: Option<std::thread::ThreadId> = None;
+    use std::sync::RwLock;
+
+    static THREAD_ID: RwLock<Option<std::thread::ThreadId>> = RwLock::new(None);
 
     pub fn set_thread_id() {
-        unsafe {
-            THREAD_ID = Some(std::thread::current().id());
-        }
+        let thread_id = std::thread::current().id();
+        *THREAD_ID
+            .write()
+            .expect("Macroquad thread ID lock poisoned") = Some(thread_id);
     }
 
     pub fn same_thread() {
-        unsafe {
-            thread_local! {
-                static CURRENT_THREAD_ID: std::thread::ThreadId = std::thread::current().id();
-            }
-            assert!(THREAD_ID.is_some());
-            assert!(THREAD_ID.unwrap() == CURRENT_THREAD_ID.with(|id| *id));
+        thread_local! {
+            static CURRENT_THREAD_ID: std::thread::ThreadId = std::thread::current().id();
+        }
+        // Release the read lock before checking the copied ID.
+        let thread_id = *THREAD_ID.read().expect("Macroquad thread ID lock poisoned");
+        assert_eq!(
+            thread_id.expect("Macroquad thread is not initialized"),
+            CURRENT_THREAD_ID.with(|id| *id),
+            "Macroquad accessed from a different thread"
+        );
+    }
+
+    #[cfg(all(test, not(target_arch = "wasm32")))]
+    mod tests {
+        use super::{same_thread, set_thread_id, THREAD_ID};
+        use std::{panic::catch_unwind, thread};
+
+        // Keep these checks together: they exercise the same global thread ID.
+        #[test]
+        fn thread_checks_allow_reinitialization_and_reject_wrong_threads() {
+            assert!(catch_unwind(same_thread).is_err());
+
+            set_thread_id();
+            same_thread();
+            assert!(thread::spawn(same_thread).join().is_err());
+            same_thread();
+
+            // A later window/test can initialize on another thread.
+            thread::spawn(|| {
+                set_thread_id();
+                same_thread();
+            })
+            .join()
+            .unwrap();
+            assert!(catch_unwind(same_thread).is_err());
+
+            set_thread_id();
+            same_thread();
+            *THREAD_ID.write().unwrap() = None;
         }
     }
 }

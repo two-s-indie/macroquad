@@ -12,6 +12,10 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Protect the registered Macroquad thread ID with an `RwLock`, removing its
+  `static_mut_refs` warning and unsafe global access while preserving thread
+  reassignment during window/test initialization. Add regression coverage for
+  uninitialized access, wrong-thread access, and reinitialization.
 - Make borrowed return lifetimes explicit in UI and scene APIs and remove the
   unused `MiniquadTexture` import to resolve lifetime-syntax and unused-import
   warnings without changing runtime behavior.
