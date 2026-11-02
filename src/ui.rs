@@ -734,7 +734,7 @@ impl Ui {
         size: Vec2,
         titlebar: bool,
         movable: bool,
-    ) -> WindowContext {
+    ) -> WindowContext<'_> {
         if parent.is_some() {
             self.child_window_stack
                 .push(self.active_window.unwrap_or(0));
@@ -824,7 +824,7 @@ impl Ui {
         }
     }
 
-    pub(crate) fn begin_modal(&mut self, id: Id, position: Vec2, size: Vec2) -> WindowContext {
+    pub(crate) fn begin_modal(&mut self, id: Id, position: Vec2, size: Vec2) -> WindowContext<'_> {
         self.input.window_active = true;
         self.in_modal = true;
 
@@ -881,7 +881,7 @@ impl Ui {
         self.input.window_active = self.is_input_hovered(self.active_window.unwrap_or(0));
     }
 
-    pub(crate) fn get_active_window_context(&mut self) -> WindowContext {
+    pub(crate) fn get_active_window_context(&mut self) -> WindowContext<'_> {
         let focused;
         let window = if self.in_modal == false {
             match self.active_window {
@@ -1157,7 +1157,7 @@ impl Ui {
         context.window.same_line(x);
     }
 
-    pub fn canvas(&mut self) -> DrawCanvas {
+    pub fn canvas(&mut self) -> DrawCanvas<'_> {
         let context = self.get_active_window_context();
 
         DrawCanvas { context }

@@ -377,7 +377,7 @@ impl Scene {
         }
     }
 
-    pub fn get_any(&mut self, handle: HandleUntyped) -> Option<RefMutAny> {
+    pub fn get_any(&mut self, handle: HandleUntyped) -> Option<RefMutAny<'_>> {
         let handle = handle.0;
         let cell = self.nodes.get_mut(handle.id)?;
 

@@ -12,6 +12,9 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Make borrowed return lifetimes explicit in UI and scene APIs and remove the
+  unused `MiniquadTexture` import to resolve lifetime-syntax and unused-import
+  warnings without changing runtime behavior.
 - Declare `one_screenshot` as an expected custom cfg under `[lints.rust]` to
   eliminate its `unexpected_cfgs` warnings. Preserve the opt-in
   `RUSTFLAGS='--cfg one_screenshot'` debug mode, which saves `screenshot.png`
