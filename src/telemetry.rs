@@ -1,6 +1,6 @@
 //! Frame profiling and rendering diagnostics local to the current thread.
 
-use crate::{get_context, get_quad_context, time::get_time};
+use crate::{get_context, time::get_time};
 
 use std::{cell::RefCell, collections::HashMap};
 
@@ -372,22 +372,23 @@ pub struct DrawCallTelemetry {
 }
 
 pub(crate) fn track_drawcall(
+    ctx: &mut dyn miniquad::RenderingBackend,
     pipeline: &miniquad::Pipeline,
     bindings: &miniquad::Bindings,
     indices_count: usize,
 ) {
-    let texture = get_quad_context().new_render_texture(miniquad::TextureParams {
+    let texture = ctx.new_render_texture(miniquad::TextureParams {
         width: 128,
         height: 128,
         ..Default::default()
     });
 
-    let pass = Some(get_quad_context().new_render_pass(texture, None));
-    get_quad_context().begin_pass(pass, miniquad::PassAction::clear_color(0.4, 0.8, 0.4, 1.));
-    get_quad_context().apply_pipeline(pipeline);
-    get_quad_context().apply_bindings(bindings);
-    get_quad_context().draw(0, indices_count as _, 1);
-    get_quad_context().end_render_pass();
+    let pass = Some(ctx.new_render_pass(texture, None));
+    ctx.begin_pass(pass, miniquad::PassAction::clear_color(0.4, 0.8, 0.4, 1.));
+    ctx.apply_pipeline(pipeline);
+    ctx.apply_bindings(bindings);
+    ctx.draw(0, indices_count as _, 1);
+    ctx.end_render_pass();
 
     PROFILER.with_borrow_mut(|profiler| {
         profiler.drawcalls.push(DrawCallTelemetry {

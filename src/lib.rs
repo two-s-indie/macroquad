@@ -416,17 +416,12 @@ impl Context {
 
     /// Returns the handle for this texture.
     pub fn raw_miniquad_id(&self, handle: &TextureHandle) -> miniquad::TextureId {
-        match handle {
-            TextureHandle::Unmanaged(texture) => *texture,
-            TextureHandle::Managed(texture) => self
-                .textures
-                .texture(texture.0)
-                .unwrap_or(self.gl.white_texture),
-            TextureHandle::ManagedWeak(texture) => self
-                .textures
-                .texture(*texture)
-                .unwrap_or(self.gl.white_texture),
-        }
+        self.textures.resolve(handle, self.gl.white_texture)
+    }
+
+    pub(crate) fn set_texture(&mut self, texture: Option<&texture::Texture2D>) {
+        let texture = texture.map(|texture| self.raw_miniquad_id(&texture.texture));
+        self.gl.texture_raw(texture);
     }
 
     /// Returns the files which have been dropped onto the window.
@@ -441,18 +436,25 @@ impl Context {
 
         let color = Self::DEFAULT_BG_COLOR;
 
-        get_quad_context().clear(Some((color.r, color.g, color.b, color.a)), None, None);
+        self.quad_context
+            .clear(Some((color.r, color.g, color.b, color.a)), None, None);
         self.gl.reset();
     }
 
     fn end_frame(&mut self) {
         self.perform_render_passes();
 
-        self.ui_context.draw(get_quad_context(), &mut self.gl);
+        self.ui_context.draw(
+            &mut *self.quad_context,
+            &mut self.gl,
+            &self.textures,
+            self.frame_time as f32,
+            glam::vec2(self.screen_width, self.screen_height) / miniquad::window::dpi_scale(),
+        );
         let screen_mat = self.pixel_perfect_projection_matrix();
-        self.gl.draw(get_quad_context(), screen_mat);
+        self.draw_with_projection(screen_mat);
 
-        get_quad_context().commit_frame();
+        self.quad_context.commit_frame();
 
         #[cfg(one_screenshot)]
         {
@@ -474,7 +476,7 @@ impl Context {
 
         self.quit_requested = false;
 
-        self.textures.garbage_collect(get_quad_context());
+        self.textures.garbage_collect(&mut *self.quad_context);
 
         // remove all touches that were Ended or Cancelled
         self.touches.retain(|_, touch| {
@@ -511,7 +513,16 @@ impl Context {
     pub(crate) fn perform_render_passes(&mut self) {
         let matrix = self.projection_matrix();
 
-        self.gl.draw(get_quad_context(), matrix);
+        self.draw_with_projection(matrix);
+    }
+
+    fn draw_with_projection(&mut self, matrix: Mat4) {
+        let white_texture = self.gl.white_texture;
+        let textures = &self.textures;
+        self.gl
+            .draw_with_texture_lookup(&mut *self.quad_context, matrix, |texture| {
+                textures.resolve(&texture.texture, white_texture)
+            });
     }
 }
 

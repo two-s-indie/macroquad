@@ -696,6 +696,17 @@ impl QuadGl {
     }
 
     pub fn draw(&mut self, ctx: &mut dyn miniquad::RenderingBackend, projection: glam::Mat4) {
+        // Legacy low-level entry point. Engine rendering uses explicit lookup;
+        // migration of externally held GL access belongs to step 7.
+        self.draw_with_texture_lookup(ctx, projection, Texture2D::raw_miniquad_id);
+    }
+
+    pub(crate) fn draw_with_texture_lookup(
+        &mut self,
+        ctx: &mut dyn miniquad::RenderingBackend,
+        projection: glam::Mat4,
+        mut texture_id: impl FnMut(&Texture2D) -> miniquad::TextureId,
+    ) {
         let white_texture = self.white_texture;
 
         for _ in 0..self.draw_calls.len() - self.draw_calls_bindings.len() {
@@ -776,7 +787,7 @@ impl QuadGl {
                 bindings.images[2 + pos] = dc
                     .textures
                     .get(name)
-                    .map_or(white_texture, Texture2D::raw_miniquad_id);
+                    .map_or_else(|| white_texture, &mut texture_id);
             }
 
             ctx.apply_pipeline(&pipeline.pipeline);
@@ -808,7 +819,7 @@ impl QuadGl {
             ctx.end_render_pass();
 
             if dc.capture {
-                telemetry::track_drawcall(&pipeline.pipeline, bindings, dc.indices_count);
+                telemetry::track_drawcall(ctx, &pipeline.pipeline, bindings, dc.indices_count);
             }
 
             dc.vertices_count = 0;
@@ -853,8 +864,11 @@ impl QuadGl {
     }
 
     pub fn texture(&mut self, texture: Option<&Texture2D>) {
-        let ctx = crate::get_context();
-        self.state.texture = texture.map(|t| ctx.raw_miniquad_id(&t.texture));
+        self.texture_raw(texture.map(Texture2D::raw_miniquad_id));
+    }
+
+    pub(crate) fn texture_raw(&mut self, texture: Option<miniquad::TextureId>) {
+        self.state.texture = texture;
     }
 
     pub fn scissor(&mut self, clip: Option<(i32, i32, i32, i32)>) {

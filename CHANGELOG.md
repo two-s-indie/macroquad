@@ -12,6 +12,13 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 4 of the context safety plan: pass backend and texture lookup
+  data explicitly through frame rendering, shapes/models, textures, text,
+  UI materials/atlases, and telemetry capture. Resolve camera inputs before
+  borrowing the context. Preserve public drawing APIs and add a real-backend
+  regression test for texture updates, atlas/text drawing, UI capture, and
+  screenshots. Resource disposal and legacy low-level access remain separate
+  migration steps; the four `CONTEXT` warnings remain.
 - Complete step 3 of the scene safety plan: replace the scene mutable global
   with scoped thread-local storage, removing its `static_mut_refs` warning.
   Restore dispatch/fixed flags and camera state on unwind; run scene callbacks

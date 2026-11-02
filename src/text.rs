@@ -290,13 +290,16 @@ pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
         miniquad::FilterMode::Linear,
     )));
 
-    let mut font = Font::load_from_bytes(atlas.clone(), bytes)?;
+    let font = Font::load_from_bytes(atlas.clone(), bytes)?;
 
     font.populate_font_cache(&Font::ascii_character_list(), 15);
 
     let ctx = get_context();
 
-    font.set_filter(ctx.default_filter_mode);
+    font.atlas
+        .lock()
+        .unwrap()
+        .set_filter_with(&mut *ctx.quad_context, ctx.default_filter_mode);
 
     Ok(font)
 }
@@ -332,9 +335,11 @@ pub fn draw_text_ex(text: impl AsRef<str>, x: f32, y: f32, params: TextParams) -
         return TextDimensions::default();
     }
 
+    let context = get_context();
     let font = params
         .font
-        .unwrap_or(&get_context().fonts_storage.default_font);
+        .cloned()
+        .unwrap_or_else(|| context.fonts_storage.default_font.clone());
 
     let dpi_scaling = miniquad::window::dpi_scale();
 
@@ -391,10 +396,12 @@ pub fn draw_text_ex(text: impl AsRef<str>, x: f32, y: f32, params: TextParams) -
 
         total_width += char_data.advance * font_scale_x + kerning_offset;
 
-        crate::texture::draw_texture_ex(
-            &crate::texture::Texture2D {
-                texture: TextureHandle::Unmanaged(atlas.texture()),
-            },
+        let texture = crate::texture::Texture2D {
+            texture: TextureHandle::Unmanaged(atlas.texture_with(&mut *context.quad_context)),
+        };
+        crate::texture::draw_texture_ex_with(
+            context,
+            &texture,
             dest.x,
             dest.y,
             params.color,

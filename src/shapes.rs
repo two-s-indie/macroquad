@@ -17,7 +17,7 @@ pub fn draw_triangle(v1: Vec2, v2: Vec2, v3: Vec2, color: Color) {
 
     let indices: [u16; 3] = [0, 1, 2];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -43,7 +43,7 @@ pub fn draw_rectangle(x: f32, y: f32, w: f32, h: f32, color: Color) {
     ];
     let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -70,7 +70,7 @@ pub fn draw_rectangle_lines(x: f32, y: f32, w: f32, h: f32, thickness: f32, colo
         0, 1, 4, 1, 4, 5, 1, 5, 6, 1, 2, 6, 3, 7, 2, 2, 7, 6, 0, 4, 3, 3, 4, 7,
     ];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -129,7 +129,7 @@ pub fn draw_rectangle_lines_ex(
         3, 6, 7,
     ];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -182,7 +182,7 @@ pub fn draw_rectangle_ex(x: f32, y: f32, w: f32, h: f32, params: DrawRectanglePa
     ];
     let indices: [u16; 6] = [0, 1, 2, 0, 2, 3];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -229,7 +229,7 @@ pub fn draw_poly(x: f32, y: f32, sides: u8, radius: f32, rotation: f32, color: C
         }
     }
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -294,7 +294,7 @@ pub fn draw_ellipse(x: f32, y: f32, w: f32, h: f32, rotation: f32, color: Color)
         }
     }
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&vertices, &indices);
 }
@@ -356,7 +356,7 @@ pub fn draw_line(x1: f32, y1: f32, x2: f32, y2: f32, thickness: f32, color: Colo
     let tx = nx / tlen;
     let ty = ny / tlen;
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(
         &[
@@ -391,7 +391,7 @@ pub fn draw_arc(
     let sides = sides as usize;
 
     let context = get_context();
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Triangles);
 
     let mut verticies = Vec::<Vertex>::with_capacity(sides * 2);

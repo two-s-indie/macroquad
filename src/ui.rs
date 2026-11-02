@@ -1052,10 +1052,15 @@ impl Ui {
     }
 
     pub fn new_frame(&mut self, delta: f32) {
-        self.root_window.resize(crate::math::vec2(
+        let screen_size = crate::math::vec2(
             crate::window::screen_width(),
             crate::window::screen_height(),
-        ));
+        );
+        self.new_frame_with_size(delta, screen_size);
+    }
+
+    fn new_frame_with_size(&mut self, delta: f32, screen_size: Vec2) {
+        self.root_window.resize(screen_size);
 
         self.frame += 1;
         self.time += delta;
@@ -1284,11 +1289,17 @@ pub(crate) mod ui_context {
             &mut self,
             ctx: &mut dyn miniquad::RenderingBackend,
             quad_gl: &mut QuadGl,
+            textures: &crate::texture::TexturesContext,
+            frame_time: f32,
+            screen_size: Vec2,
         ) {
             // TODO: this belongs to new and waits for cleaning up context initialization mess
             let material = self.material.get_or_insert_with(|| {
-                load_material(
-                    match ctx.info().backend {
+                let backend = ctx.info().backend;
+                crate::material::load_material_with(
+                    ctx,
+                    quad_gl,
+                    match backend {
                         Backend::OpenGl => ShaderSource::Glsl {
                             vertex: VERTEX_SHADER,
                             fragment: FRAGMENT_SHADER,
@@ -1320,16 +1331,18 @@ pub(crate) mod ui_context {
             std::mem::swap(&mut ui_draw_list, &mut self.ui_draw_list);
 
             let mut atlas = ui.atlas.lock().unwrap();
-            let font_texture = atlas.texture();
-            quad_gl.texture(Some(&Texture2D::unmanaged(font_texture)));
+            let font_texture = atlas.texture_with(ctx);
+            quad_gl.texture_raw(Some(font_texture));
 
-            gl_use_material(material);
+            material.apply(quad_gl);
 
             for draw_command in &ui_draw_list {
                 if let Some(ref texture) = draw_command.texture {
-                    quad_gl.texture(Some(texture));
+                    quad_gl.texture_raw(Some(
+                        textures.resolve(&texture.texture, quad_gl.white_texture),
+                    ));
                 } else {
-                    quad_gl.texture(Some(&Texture2D::unmanaged(font_texture)));
+                    quad_gl.texture_raw(Some(font_texture));
                 }
 
                 quad_gl.scissor(
@@ -1340,14 +1353,14 @@ pub(crate) mod ui_context {
                 quad_gl.draw_mode(DrawMode::Triangles);
                 quad_gl.geometry(&draw_command.vertices[..], &draw_command.indices);
             }
-            quad_gl.texture(None);
+            quad_gl.texture_raw(None);
 
-            gl_use_default_material();
+            quad_gl.pipeline(None);
 
             std::mem::swap(&mut ui_draw_list, &mut self.ui_draw_list);
 
             drop(atlas);
-            ui.new_frame(get_frame_time());
+            ui.new_frame_with_size(frame_time, screen_size);
         }
     }
 

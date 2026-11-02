@@ -4,7 +4,7 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 3 are complete. `SCENE` now uses scoped thread-local storage;
+Steps 1 through 4 are complete. `SCENE` now uses scoped thread-local storage;
 its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
 The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
 The overall engine/context migration is not yet complete.
@@ -166,20 +166,43 @@ files at the planning baseline. A direct replacement with one
 
 ### 4 Remove nested renderer and backend access
 
-- [ ] Borrow the renderer and backend together from one context access, passing
+- [x] Borrow the renderer and backend together from one context access, passing
   them explicitly into internal rendering helpers instead of calling
   `get_quad_context()` again.
-- [ ] Start with `clear_background`, draw-buffer resizing,
+- [x] Start with `clear_background`, draw-buffer resizing,
   `perform_render_passes`, and frame drawing/commit operations.
-- [ ] Pass the already-borrowed backend into telemetry draw-call capture.
-- [ ] Supply texture lookup data to rendering helpers without re-entering the
+- [x] Pass the already-borrowed backend into telemetry draw-call capture.
+- [x] Supply texture lookup data to rendering helpers without re-entering the
   entire context through `Texture2D::raw_miniquad_id()`.
-- [ ] Update internal UI rendering to use the renderer/backend it receives,
+- [x] Update internal UI rendering to use the renderer/backend it receives,
   including material initialization and material selection.
 
 Acceptance: the affected rendering paths do not reacquire the context/backend
 while already borrowing them. Rendering, material, and render-target lifetime
 tests pass. Public drawing APIs remain unchanged.
+
+Outcome: frame drawing, clearing, buffer resizing, and telemetry capture use
+the backend borrowed alongside the renderer. Internal material texture lookup
+uses the texture registry explicitly; texture creation/update/readback, atlas
+building, and text drawing no longer call global accessors under an existing
+context/backend borrow. UI drawing receives its backend, renderer, texture
+registry, frame time, and screen size; material setup and atlas upload use those
+inputs. Camera trait methods are evaluated before acquiring the context.
+
+Compatibility and remaining scope: public drawing signatures are unchanged.
+Legacy `QuadGl::draw`/`texture`, projection/viewport access, `InternalGlContext`,
+and public UI access still need step 7. Resource destructors can still reacquire
+the context during draw-list/pipeline cleanup (step 5). Input processing,
+mouse snapshots, and `one_screenshot` callbacks remain step 6. This step removes
+explicit nested rendering access, not every transitive context borrow.
+
+Validation: 61 library tests pass. Real-backend material lifetime, material
+texture lifetime, render-target lifetime, and the new rendering-context test
+pass. The new test checks exact texture/atlas pixels, text output, UI draw-call
+capture, buffer resizing, and screenshot pixels. `cargo build`, all-target and
+WebAssembly library checks, formatting, and whitespace checks pass. Four
+`CONTEXT` warnings remain; all-target checking also reports the existing tiled
+lifetime warning. Graphics tests ran on Windows; Metal was not executed.
 
 ### 5 Move resource disposal into independent queues
 

@@ -278,6 +278,11 @@ impl Camera for Camera3D {
 
 /// Set active 2D or 3D camera.
 pub fn set_camera(camera: &dyn Camera) {
+    // Camera implementations may query screen or texture dimensions.
+    let render_pass = camera.render_pass();
+    let viewport = camera.viewport();
+    let depth_enabled = camera.depth_enabled();
+    let matrix = camera.matrix();
     let context = get_context();
 
     // flush previous camera draw calls
@@ -285,11 +290,11 @@ pub fn set_camera(camera: &dyn Camera) {
 
     context
         .gl
-        .render_pass(camera.render_pass().map(|rt| rt.raw_miniquad_id()));
+        .render_pass(render_pass.as_ref().map(|rt| rt.raw_miniquad_id()));
 
-    context.gl.viewport(camera.viewport());
-    context.gl.depth_test(camera.depth_enabled());
-    context.camera_matrix = Some(camera.matrix());
+    context.gl.viewport(viewport);
+    context.gl.depth_test(depth_enabled);
+    context.camera_matrix = Some(matrix);
 }
 
 /// Reset default 2D camera mode.

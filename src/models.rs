@@ -47,7 +47,7 @@ pub struct Mesh {
 pub fn draw_mesh(mesh: &Mesh) {
     let context = get_context();
 
-    context.gl.texture(mesh.texture.as_ref());
+    context.set_texture(mesh.texture.as_ref());
     context.gl.draw_mode(DrawMode::Triangles);
     context.gl.geometry(&mesh.vertices[..], &mesh.indices[..]);
 }
@@ -66,7 +66,7 @@ pub fn draw_line_3d(start: Vec3, end: Vec3, color: Color) {
 
     let line = [Vertex::new2(start, uv, color), Vertex::new2(end, uv, color)];
 
-    context.gl.texture(None);
+    context.set_texture(None);
     context.gl.draw_mode(DrawMode::Lines);
     context.gl.geometry(&line, &indices);
 }
@@ -124,7 +124,7 @@ pub fn draw_plane(center: Vec3, size: Vec2, texture: Option<&Texture2D>, color: 
 
     {
         let context = get_context();
-        context.gl.texture(texture);
+        context.set_texture(texture);
     }
     draw_quad([v1, v2, v3, v4]);
 }
@@ -162,7 +162,7 @@ pub fn draw_affine_parallelogram(
 
     {
         let context = get_context();
-        context.gl.texture(texture);
+        context.set_texture(texture);
     }
     draw_quad([v1, v2, v3, v4]);
 }
@@ -212,7 +212,7 @@ pub fn draw_affine_parallelepiped(
 
 pub fn draw_cube(position: Vec3, size: Vec3, texture: Option<&Texture2D>, color: Color) {
     let context = get_context();
-    context.gl.texture(texture);
+    context.set_texture(texture);
 
     let (x, y, z) = (position.x, position.y, position.z);
     let (width, height, length) = (size.x, size.y, size.z);
@@ -469,7 +469,7 @@ pub fn draw_sphere_ex(
 
     let scale = vec3(radius, radius, radius);
 
-    context.gl.texture(texture);
+    context.set_texture(texture);
     context.gl.draw_mode(params.draw_mode);
 
     for i in 0..rings + 1 {
@@ -613,7 +613,7 @@ pub fn draw_cylinder_ex(
 
     let sides = params.sides;
 
-    context.gl.texture(texture);
+    context.set_texture(texture);
     context.gl.draw_mode(params.draw_mode);
 
     use std::f32::consts::PI;

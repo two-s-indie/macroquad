@@ -26,6 +26,9 @@ impl std::fmt::Debug for Material {
 }
 
 impl Material {
+    pub(crate) fn apply(&self, gl: &mut crate::quad_gl::QuadGl) {
+        gl.pipeline(Some(self.pipeline.0));
+    }
     /// Set GPU uniform value for this material.
     /// "name" should be from "uniforms" list used for material creation.
     /// Otherwise uniform value would be silently ignored.
@@ -123,10 +126,18 @@ pub fn load_material(
     shader: crate::ShaderSource,
     params: MaterialParams,
 ) -> Result<Material, Error> {
-    let context = &mut get_context();
+    let context = get_context();
+    load_material_with(&mut *context.quad_context, &mut context.gl, shader, params)
+}
 
-    let pipeline = context.gl.make_pipeline(
-        &mut *context.quad_context,
+pub(crate) fn load_material_with(
+    backend: &mut dyn miniquad::RenderingBackend,
+    gl: &mut crate::quad_gl::QuadGl,
+    shader: crate::ShaderSource,
+    params: MaterialParams,
+) -> Result<Material, Error> {
+    let pipeline = gl.make_pipeline(
+        backend,
         shader,
         params.pipeline_params,
         params.uniforms,
@@ -140,7 +151,7 @@ pub fn load_material(
 
 /// All following macroquad rendering calls will use the given material.
 pub fn gl_use_material(material: &Material) {
-    get_context().gl.pipeline(Some(material.pipeline.0));
+    material.apply(&mut get_context().gl);
 }
 
 /// Use default macroquad material.
