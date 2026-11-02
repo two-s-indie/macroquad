@@ -30,7 +30,7 @@ all-features = true
 miniquad = { version = "=0.4.11", features = ["log-impl"] }
 quad-rand = "0.2.3"
 glam = { version = "0.34.2", features = ["scalar-math"] }
-image = { version = "0.24", default-features = false, features = ["png", "tga"] }
+image = { version = "0.25", default-features = false, features = ["png", "tga"] }
 macroquad_macro = { version = "0.1.8", path = "macroquad_macro" }
 fontdue = "0.9"
 backtrace = { version = "0.3.60", optional = true }

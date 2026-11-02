@@ -12,6 +12,12 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Changed
 
+- Update `image` from `0.24` to `0.25`, retaining disabled default features and
+  PNG/TGA support. Validated with `0.25.10`, which requires Rust 1.88 or newer.
+  Add regression tests for PNG export/reload (including the existing vertical
+  flip) and TGA decoding, checking dimensions, pixel colors, and alpha values.
+  Downstream code passing `image` types such as `ImageFormat` or `ImageError`
+  across Macroquad's API must also use a compatible `image` version.
 - Update `glam` from `0.27` to `0.34.2`, retaining `scalar-math` and the
   optional `glam-serde` feature. Migrate camera view and projection constructors
   to the new `glam::camera` API while preserving right-handed OpenGL conventions
