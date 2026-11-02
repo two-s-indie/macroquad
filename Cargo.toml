@@ -52,7 +52,8 @@ macroquad-platformer = { path = "./physics-platformer" }
 macroquad = { path = './' }
 
 #quad-snd = {path = '../quad-snd'}
-miniquad = { path = '../miniquad' }
+#miniquad = { path = '../miniquad' }
+miniquad = { git = "https://github.com/two-s-indie/miniquad.git", branch = "game" }
 #miniquad = { git = "https://github.com/not-fl3/miniquad", branch = "msaa_render_texture" }
 #quad-gl = {path = './quad-gl'}
 
