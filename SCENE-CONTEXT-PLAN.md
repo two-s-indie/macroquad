@@ -6,7 +6,7 @@ in small, independently verifiable changes.
 
 The latest verified `cargo build` reports five `static_mut_refs` warnings:
 one from `SCENE` and four from `CONTEXT`. The `THREAD_ID`, `STORAGE`, and
-`PROFILER` changes are already implemented. Step 1 is complete; neither remaining
+`PROFILER` changes are already implemented. Steps 1 and 2 are complete; neither remaining
 subsystem is yet declared safe. The warning count is unchanged.
 
 ## Working rules
@@ -27,8 +27,8 @@ subsystem is yet declared safe. The warning count is unchanged.
 
 ## Part one SCENE
 
-Relevant code: [scene.rs](src/experimental/scene.rs),
-[arena.rs](src/experimental/scene/arena.rs), and scene-based tweens in
+Relevant code: [scene.rs](src/experimental/scene.rs), its owned node entries and
+guards (which replace the former arena), and scene-based tweens in
 [coroutines.rs](src/experimental/coroutines.rs).
 
 ### 1 Establish scene behavior and ownership requirements
@@ -53,44 +53,64 @@ Acceptance: regression tests describe supported behavior, and the ownership and
 cross-thread handle strategy is recorded before replacing global storage.
 Tests that expose an existing defect become requirements for the next step.
 
-Outcome: [SCENE-OWNERSHIP-AUDIT.md](SCENE-OWNERSHIP-AUDIT.md) records behavior,
+Step 1 outcome: [SCENE-OWNERSHIP-AUDIT.md](SCENE-OWNERSHIP-AUDIT.md) records behavior,
 pointer hazards, atomic rejection requirements, stable owned guards, and
 sendable handles with scene/session identity and owner-thread checks. Nine
-headless characterization tests pass; five ignored acceptance tests reproduce
-known defects and all fail when explicitly run. Explicit clock/camera hooks keep
+headless characterization tests passed; five initially ignored acceptance tests
+reproduced known defects (all are enabled and passing after step 2). Explicit clock/camera hooks keep
 production ordering. These checks do not establish memory safety. See the audit
 for deferred lens, alignment, callback reentry, and teardown validation.
-Validation: `cargo test --lib` passes 33 tests with those five ignored;
+Step 1 validation: `cargo test --lib` passed 33 tests with those five ignored;
 `cargo build`, `cargo check --all-targets`, formatting, and whitespace checks pass.
 The existing five main-library global-reference warnings and the tiled crate's
 lifetime warning remain. Miri is unavailable; graphics paths were only compiled.
 
 ### 2 Make node guards and field projections retain valid storage
 
-- [ ] Give each node stable ownership independent of the registry's backing
+- [x] Give each node stable ownership independent of the registry's backing
   vector. Prefer an owned node entry and checked typed access over raw pointers
   into movable registry entries.
-- [ ] Make typed and untyped guards retain the node and its borrow state until
+- [x] Make typed and untyped guards retain the node and its borrow state until
   release. Growing the registry, removing an entry, or reusing a slot must not
   invalidate live guards or their capability access.
-- [ ] Enforce exclusive mutable access per node. Check node type and generation
+- [x] Enforce exclusive mutable access per node. Check node type and generation
   before producing typed access.
-- [ ] Define deletion/clear behavior with outstanding guards: reject before
+- [x] Define deletion/clear behavior with outstanding guards: reject before
   modifying the registry or defer destruction until release. Preserve existing
   supported behavior and document any change.
-- [ ] Repair `Lens` ownership as part of this guard migration: a field borrow
+- [x] Repair `Lens` ownership as part of this guard migration: a field borrow
   must retain its parent-node guard. Avoid deriving field offsets by creating a
   reference to an uninitialized `T`.
-- [ ] Drop removed node data outside registry borrows so destructors can safely
+- [x] Drop removed node data outside registry borrows so destructors can safely
   access other nodes or engine resources.
 
 Acceptance: tests cover guard survival during registry growth, stale-handle
 rejection, exact-once destruction, capabilities, and tween/field-projection
 lifetimes. No guard depends on a pointer into a relocatable registry entry.
 
+Outcome: typed boxes replace the arena, and guards exclusively own node data
+and capabilities while retaining an `Rc` entry. Lookup checks scene identity,
+generation, owner thread, and type. Clear/delete validate before mutation;
+detached entries are dropped outside registry access. Iterators snapshot full
+identities. Typed callback adapters replace erased function-pointer casts.
+Callback dispatch was shortened as a prerequisite for safe deletion from callbacks;
+the global replacement and lifecycle changes remain step 3.
+
+Field projections now run on initialized nodes inside a scoped parent guard.
+`LinearTweenFuture<T, T1, F>` retains its projection and supports borrowed
+closures; explicit annotations and `Send` requirements may need migration.
+The audit records these changes and the revised scene memory metric.
+
+Validation: 51 library tests pass, including 27 scene tests and all five former
+defect reproducers; no tests are ignored. `cargo build`, `cargo check --all-targets`,
+and `cargo check --lib --target wasm32-unknown-unknown` pass. Formatting and
+whitespace checks pass. The five global-reference warnings remain, along with
+the tiled lifetime warning in all-target checks. Graphics paths were compiled,
+not executed; Miri is still unavailable.
+
 ### 3 Separate scene callbacks and replace the global
 
-- [ ] Refactor scene update into short registry operations and callback dispatch.
+- [x] Refactor scene update into short registry operations and callback dispatch.
   Acquire the node guard and callback information, release the registry borrow,
   invoke user code, then reconcile pending changes.
 - [ ] Preserve callback ordering, fixed-step timing, and camera selection. Review
@@ -236,8 +256,8 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next implementation task is step 2: make node guards and field projections
-retain valid storage. Some preparatory steps will deliberately leave warning counts
+The next implementation task is step 3: replace the scene global and finish
+callback/lifecycle handling. Preparatory steps deliberately leave warning counts
 unchanged until the corresponding global can be replaced safely.
 
 ## Rust reference guidance

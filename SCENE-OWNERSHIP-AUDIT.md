@@ -1,10 +1,85 @@
-# Scene ownership baseline
+# Scene ownership audit
 
-Step 1 of [SCENE-CONTEXT-PLAN.md](SCENE-CONTEXT-PLAN.md), on
-`feature/scene-context-safety`. This audit records existing behavior and decisions
-for the migration. It does not certify the existing unsafe implementation.
+Steps 1 and 2 of [SCENE-CONTEXT-PLAN.md](SCENE-CONTEXT-PLAN.md), on
+`feature/scene-context-safety`. The current outcome is recorded first; the
+historical step 1 baseline follows. The scene global still needs replacement.
 
-## Current behavior
+## Step 2 outcome
+
+- Each node uses a correctly aligned `Box<T>` erased through `Any`, plus a stable
+  `Rc<NodeEntry>`. A guard takes sole ownership of the boxed value and capabilities
+  from the entry; the empty entry rejects competing borrows. Releasing a guard
+  returns its value. A detached entry is destroyed when its last guard releases it.
+  No guard contains a raw node pointer, an arena pointer, or a reference into the
+  registry vector. The arena and unsupported `Sync`/`Send` implementations were
+  removed; sendable handles use a non-owning type marker.
+- Node types are checked on typed lookup and untyped conversion. Lookup returns
+  `None` for mismatches; `to_typed` panics and releases its guard on a mismatch.
+  IDs include a unique scene identity and slot generation. Scene identity exhaustion
+  fails without wrapping; exhausted slot generations retire the slot. Nodes retain
+  thread ownership checks. This does not make concurrent access to the remaining
+  mutable global safe; that requires step 3.
+- Clear preflights all affected nodes. Borrowed persistent nodes survive; any
+  borrowed nonpersistent node rejects the entire registry operation. Public clear
+  also preflights before coroutine cancellation and rechecks afterward. Coordination
+  with cancellation side effects and engine shutdown remains later work.
+  Delete validates before removing membership. Both operations return detached
+  entries and destroy them after registry access ends. Destructors can access other
+  nodes, add nodes, and unwind without losing unrelated membership or leaving a
+  guard's borrow state stuck. Arbitrary destructor side effects are not rolled back.
+- Iteration snapshots full IDs; clearing and immediate slot reuse cannot invalidate
+  indexes, revive stale entries, or produce duplicates. Slot reuse allocates fresh
+  typed data, resets metadata/capabilities, and no longer depends on the old size.
+- Callback adapters accept owned untyped guards and check their types before
+  invoking `Node` methods. Dispatch no longer holds a registry borrow across user
+  code, a necessary prerequisite for deletion inside callbacks. Cameras are retained
+  independently for each draw pass. The global accessor, panic recovery for fixed
+  flags/camera state, and engine initialization/shutdown are still step 3 work.
+  Per-pass ordering, strict fixed timing, and the legacy early-draw-before-ready
+  behavior are preserved.
+- `Lens::with` applies a retained typed projection to initialized data while owning
+  the parent guard. The supplied field operation cannot return a reference tied to
+  that temporary borrow. The guard is released on return or panic. There are no
+  fabricated uninitialized references, byte offsets, or escaping field references.
+
+### Compatibility and costs
+
+Ordinary scene entry points and guard methods retain their signatures, including
+the const handle accessors. A guard survives destruction of its originating registry;
+its later `persist` or `delete` cannot affect another session's same-numbered slot.
+Handles remain `Copy` and `Send`, including handles to non-`Send` nodes.
+
+The explicit tween type is now `LinearTweenFuture<T, T1, F>` (value, node,
+projection). Normal inferred `linear(...)` calls and borrowed projections in
+`follow_path` continue to work. The closure is retained and evaluated each poll,
+so it may read initialized node state and select a different field. Previously
+it ran once against uninitialized memory. A future borrowing a projection cannot
+outlive that borrow; a future submitted to a `Send`/`'static` scheduler must own a
+projection satisfying those bounds. Projections capturing non-`Send` values may
+still be polled locally. No explicit tween type uses were found in the checked-out
+game. Headless tests exercise both tween APIs, including non-`Send` nodes and
+borrowed closures, and ensure no node guard crosses a poll boundary.
+
+Node allocation now uses a typed box and an entry allocation; each iterator owns
+an ID snapshot. Performance measurement remains step 9. `scene_allocated_memory()`
+now sums inline payload sizes of registered nodes, including borrowed nodes,
+rather than reporting an arena offset. It excludes capabilities, node-owned heap
+allocations, registry/guard overhead, and detached nodes from an old scene.
+
+### Step 2 verification
+
+- `cargo test --lib`: 51 passed, none ignored. The 27 scene tests include all five
+  formerly ignored defect reproducers, registry growth, detached guards,
+  exactly-once destruction, destructor reentry/panics, alignment/zero-size nodes,
+  projection lifetimes/unwinding, tween polling, and foreign-thread scene IDs.
+- `cargo build`, `cargo check --all-targets`, and
+  `cargo check --lib --target wasm32-unknown-unknown`: passed. All five existing
+  main-library global-reference warnings remain. The tiled lifetime warning also
+  remains in all-target checks. Graphics tests/examples were compiled, not run.
+- Formatting and whitespace checks passed. Miri is not installed in the nightly
+  toolchain; these ordinary tests do not constitute an aliasing proof.
+
+## Step 1 behavior baseline (before the ownership migration)
 
 | Operation | Observed implementation and compatibility requirement |
 | --- | --- |
@@ -21,11 +96,12 @@ for the migration. It does not certify the existing unsafe implementation.
 | Timing | Sample the clock after ready. Snap deltas within 0.0002 seconds of 1/120, 1/60, or 1/30. Accumulate time and run fixed steps while the accumulator is strictly greater than 1/60. Preserve this boundary and ordering during refactoring. |
 | Cameras | Draw once per enabled camera in slot order; set camera position and push/set/pop camera state around each pass. Default: one camera. The current bounds assertion also allows invalid slot 4; leave unrelated API cleanup separate. |
 
-`Scene::new_at` and `Scene::update_with` supply explicit time and camera hooks
-for tests. Production wrappers retain the actual clock and camera operations.
-The hooks preserve clock sampling after ready and do not change callback ownership.
+Step 1 introduced `Scene::new_at` and `Scene::update_with` with explicit time and
+camera hooks for tests. Step 2 moved dispatch to the module-level `update_with`
+to release registry access around callbacks. Production wrappers retain the
+actual clock and camera operations, including clock sampling after ready.
 
-## Retained pointers and safety requirements
+### Retained pointers and safety requirements at step 1
 
 | Storage/access | Finding | Migration requirement |
 | --- | --- | --- |
@@ -45,7 +121,7 @@ Those paths require structural fixes before meaningful memory-safety validation.
 The normal callback tests exercise the existing unsafe dispatcher; ordinary test
 success does not validate its aliasing or function-pointer assumptions.
 
-## Selected ownership and handle strategy
+### Ownership and handle strategy selected at step 1
 
 For step 2, use independently owned, stable node entries, preferably `Rc` entries
 with per-node checked borrowing and checked type erasure. Both typed and untyped
@@ -89,7 +165,7 @@ adding unchecked lifetime extensions. `follow_path` currently borrows its closur
 when constructing each linear tween, so an indiscriminate `'static` bound is not
 a compatible solution.
 
-## Consumer audit
+### Consumer audit
 
 - `tests/coroutine_pause.rs` captures scene handles in `start_coroutine` futures.
   Preserve this use while rejecting wrong-scene access at lookup.
@@ -98,11 +174,12 @@ a compatible solution.
 - Searches of the checked-out sibling `Where-s-the-Yokai` Rust sources found no
   direct scene API usage. This is not evidence about other downstream consumers.
 
-## Regression coverage and verification
+### Step 1 regression coverage and verification
 
 Tests live in [scene/tests.rs](src/experimental/scene/tests.rs). A serialized fixture
-installs a headless scene, restores the previous global on unwind, and explicitly
-drops remaining test nodes. This fixture is not the production teardown solution.
+installs a headless scene and restores the previous global on unwind. At step 1
+it manually dropped remaining node values; step 2 lets owned entries drop them.
+This fixture is not the production teardown solution.
 Registry clearing is tested directly; public coroutine cancellation and actual
 rendering remain later integration checks.
 
@@ -111,8 +188,7 @@ slot reuse, persistence and destruction, type/capability queries, iterator chang
 clock sampling, fixed-step boundaries and snapping, camera pass ordering, callback
 addition, and callback deletion of self/another node.
 
-Five ignored acceptance tests are executable reproducers, each annotated with
-its owning migration step:
+Five initially ignored acceptance tests supplied executable reproducers:
 
 | Test | Required correction |
 | --- | --- |
@@ -122,17 +198,16 @@ its owning migration step:
 | `foreign_scene_handle_is_rejected` | Validate scene/session identity. |
 | `immediate_slot_reuse_does_not_duplicate_iteration` | Validate snapshot generations. |
 
-Running `cargo test --lib experimental::scene::tests -- --ignored` currently
-fails all five as expected. Remove each ignore when its correction is implemented;
-do not invert the assertions to accept the defect. Alignment, lens lifetime,
-destructor reentry, thread/session teardown, and panic recovery need additional
-tests during steps 2 and 3 after their unsafe paths have been replaced.
+At step 1, running `cargo test --lib experimental::scene::tests -- --ignored`
+failed all five as expected. Step 2 removed their ignores without inverting the
+assertions, and added alignment, projection lifetime, destructor reentry, and
+ownership tests. Engine teardown and callback panic recovery remain step 3 work.
 
 Miri is unavailable in the installed nightly toolchain. No Miri or graphics
 runtime validation is claimed for this step. The five existing main-library
 `static_mut_refs` warnings are intentionally unchanged until global replacement.
 
-Verification on Windows:
+Step 1 verification on Windows (superseded by the step 2 results above):
 
 - `cargo test --lib`: 33 passed, 5 ignored (the known defects above).
 - `cargo build`: passed, with the same five global-reference warnings.

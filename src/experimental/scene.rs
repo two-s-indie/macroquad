@@ -1,116 +1,92 @@
-use std::{any::Any, marker::PhantomData, ops::Drop};
-
 use crate::camera::Camera2D;
-
 pub use macroquad_macro::CapabilityTrait;
-
-mod arena;
+use std::{
+    any::Any,
+    cell::{Cell, RefCell},
+    marker::PhantomData,
+    ops::{Deref, DerefMut},
+    rc::Rc,
+    sync::atomic::{AtomicU64, Ordering},
+    thread::ThreadId,
+};
 
 #[rustfmt::skip]
 pub trait Node {
     fn ready(_node: RefMut<Self>) where Self: Sized {}
-    fn update(_node: RefMut<Self>) where Self: Sized  {}
-    fn fixed_update(_node: RefMut<Self>) where Self: Sized  {}
-    fn draw(_node: RefMut<Self>) where Self: Sized  {}
-}
-
-trait NodeAny: Any + Node {
-    fn as_any(&self) -> &dyn Any;
-    fn as_any_mut(&mut self) -> &mut dyn Any;
-}
-
-impl<T: Node + 'static> NodeAny for T {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-    fn as_any_mut(&mut self) -> &mut dyn Any {
-        self
-    }
+    fn update(_node: RefMut<Self>) where Self: Sized {}
+    fn fixed_update(_node: RefMut<Self>) where Self: Sized {}
+    fn draw(_node: RefMut<Self>) where Self: Sized {}
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 struct Id {
+    scene: u64,
     id: usize,
     generation: u64,
 }
 
+/// A copyable identifier, not ownership of a node. Sending a handle does not
+/// permit accessing its node from another thread or engine session.
 pub struct Handle<T: 'static> {
     id: Option<Id>,
-    _marker: PhantomData<T>,
+    // Identifies T without owning it: handles are Send even for non-Send nodes.
+    _marker: PhantomData<fn() -> T>,
 }
-
-unsafe impl<T: 'static> Send for Handle<T> {}
 
 #[derive(Clone, Copy, Debug)]
 pub struct HandleUntyped(Id);
 
-impl<T: 'static> std::fmt::Debug for Handle<T> {
+impl<T> std::fmt::Debug for Handle<T> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{:?}", self.id)?;
-
-        Ok(())
+        self.id.fmt(f)
     }
 }
-
-impl<T: 'static> Clone for Handle<T> {
-    fn clone(&self) -> Handle<T> {
-        Handle {
-            id: self.id,
-            _marker: PhantomData,
-        }
+impl<T> Clone for Handle<T> {
+    fn clone(&self) -> Self {
+        *self
     }
 }
-
-impl<T: 'static> Copy for Handle<T> {}
+impl<T> Copy for Handle<T> {}
 
 impl<T> Handle<T> {
-    pub const fn null() -> Handle<T> {
-        Handle {
+    pub const fn null() -> Self {
+        Self {
             id: None,
             _marker: PhantomData,
         }
     }
-
     pub fn untyped(&self) -> HandleUntyped {
         HandleUntyped(self.id.unwrap())
     }
-
     pub const fn as_trait<T1: ?Sized>(&self) {}
-}
 
-pub(crate) struct Lens<T> {
-    handle: HandleUntyped,
-    offset: isize,
-    _marker: PhantomData<T>,
-}
-
-impl<T> Lens<T> {
-    pub fn get(&mut self) -> Option<&mut T> {
-        let node = get_untyped_node(self.handle)?;
-
-        Some(unsafe { &mut *((node.data as *mut u8).offset(self.offset) as *mut T) })
+    pub(crate) fn lens<U, F>(self, project: F) -> Lens<T, U, F>
+    where
+        F: for<'a> FnMut(&'a mut T) -> &'a mut U,
+    {
+        assert!(self.id.is_some());
+        Lens {
+            handle: self,
+            project,
+            _marker: PhantomData,
+        }
     }
 }
 
-impl<T> Handle<T> {
-    pub(crate) fn lens<F, T1>(&self, f: F) -> Lens<T1>
-    where
-        F: for<'r> FnOnce(&'r mut T) -> &'r mut T1,
-    {
-        assert!(self.id.is_some());
-
-        let offset = unsafe {
-            let mut base = std::mem::MaybeUninit::<T>::uninit();
-            let field = f(std::mem::transmute(base.as_mut_ptr())) as *mut _ as *mut u8;
-
-            (field as *mut u8).offset_from(base.as_mut_ptr() as *mut u8)
-        };
-
-        Lens {
-            handle: HandleUntyped(self.id.unwrap()),
-            offset,
-            _marker: PhantomData,
-        }
+/// Projects initialized data under a parent-node guard. A field reference
+/// cannot escape the scoped operation or outlive that guard.
+pub(crate) struct Lens<T: 'static, U, F> {
+    handle: Handle<T>,
+    project: F,
+    _marker: PhantomData<fn() -> U>,
+}
+impl<T, U, F> Lens<T, U, F>
+where
+    F: for<'a> FnMut(&'a mut T) -> &'a mut U,
+{
+    pub fn with<R>(&mut self, use_field: impl FnOnce(&mut U) -> R) -> Option<R> {
+        let mut node = unsafe { get_scene() }.get(self.handle)?;
+        Some(use_field((self.project)(&mut node)))
     }
 }
 
@@ -119,403 +95,294 @@ pub struct NodeWith<T> {
     pub capability: T,
 }
 
+/// Owns an exclusive borrow. Node data and capabilities remain valid when the
+/// registry grows or the originating scene is destroyed.
 pub struct RefMut<T: 'static> {
-    data: *mut T,
+    inner: RefMutAny<'static>,
     handle: Handle<T>,
-    capabilities: *mut Vec<Box<dyn Any>>,
-    used: *mut bool,
 }
-
-impl<T: 'static> RefMut<T> {
+impl<T> RefMut<T> {
     pub const fn handle(&self) -> Handle<T> {
-        Handle {
-            id: self.handle.id,
-            _marker: PhantomData,
-        }
+        self.handle
     }
-
     pub fn persist(&self) {
-        unsafe { get_scene() }.nodes[self.handle.id.unwrap().id]
+        self.inner.entry.permanent.set(true);
+    }
+    pub fn provides<S: Any + Copy>(&mut self, value: S) {
+        self.inner
+            .data
             .as_mut()
             .unwrap()
-            .permanent = true;
+            .capabilities
+            .push(Box::new(value));
     }
-
-    pub fn provides<S: std::any::Any + Copy>(&mut self, x: S) {
-        unsafe { (*self.capabilities).push(Box::new(x)) };
-    }
-
     pub fn delete(self) {
-        assert!(self.handle.id.is_some());
-
-        unsafe {
-            *self.used = false;
-        }
-        unsafe { get_scene() }.delete(self.handle.id.unwrap());
-        std::mem::forget(self);
+        self.inner.delete();
     }
 }
-
-impl<T> std::ops::Deref for RefMut<T> {
+impl<T> Deref for RefMut<T> {
     type Target = T;
-
     fn deref(&self) -> &T {
-        unsafe { &*self.data }
+        self.inner.downcast_ref().expect("checked node type")
     }
 }
-
-impl<T> std::ops::DerefMut for RefMut<T> {
+impl<T> DerefMut for RefMut<T> {
     fn deref_mut(&mut self) -> &mut T {
-        unsafe { &mut *self.data }
+        self.inner.downcast_mut().expect("checked node type")
     }
 }
 
-impl<T: 'static> Drop for RefMut<T> {
-    fn drop(&mut self) {
-        assert_eq!(unsafe { *self.used }, true);
-        unsafe {
-            *self.used = false;
-        }
-    }
-}
-
+/// Owns both the value and its stable entry. The lifetime parameter is retained
+/// for compatibility; guards do not borrow the scene registry.
 pub struct RefMutAny<'a> {
-    data: *mut (),
-    used: *mut bool,
-    vtable: *mut (),
-    capabilities: *mut Vec<Box<dyn Any>>,
+    data: Option<NodeData>,
+    entry: Rc<NodeEntry>,
     handle: HandleUntyped,
-
     _marker: PhantomData<&'a ()>,
 }
-
-impl<'a> RefMutAny<'a> {
+impl RefMutAny<'_> {
+    /// Construct an identifier. Lookup validates its requested type.
     pub const fn handle<T>(&self) -> Handle<T> {
         Handle {
             id: Some(self.handle.0),
             _marker: PhantomData,
         }
     }
-
     pub fn delete(self) {
-        unsafe {
-            *self.used = false;
-        }
-        unsafe { get_scene() }.delete(self.handle.0);
-        std::mem::forget(self);
+        let id = self.entry.id;
+        // Restore the value before removing membership. No user destructor runs
+        // here while the registry still owns this entry.
+        drop(self);
+        let removed = unsafe { get_scene() }.delete(id);
+        // Destructors can look up, add, or delete other nodes.
+        drop(removed);
     }
-
-    pub fn to_typed<T>(self) -> RefMut<T> {
-        let res = RefMut {
-            data: self.data as *mut T,
-            handle: Handle {
-                id: Some(self.handle.0),
-                _marker: PhantomData::<T>,
-            },
-            capabilities: self.capabilities,
-            used: self.used,
+    /// Panics on a type mismatch, releasing this borrow during unwinding.
+    pub fn to_typed<T: 'static>(mut self) -> RefMut<T> {
+        assert!(self.is::<T>(), "node type mismatch");
+        let handle = self.handle();
+        let inner = RefMutAny {
+            data: self.data.take(),
+            entry: Rc::clone(&self.entry),
+            handle: self.handle,
+            _marker: PhantomData,
         };
-
-        // "used" is now moved to RefMut and will be invalidated by RefMut's drop
-        // no need for RefMutAny's drop than
-        std::mem::forget(self);
-
-        res
+        RefMut { inner, handle }
     }
 }
-
-impl<'a> std::ops::Deref for RefMutAny<'a> {
+impl Deref for RefMutAny<'_> {
     type Target = dyn Any;
-
     fn deref(&self) -> &Self::Target {
-        let trait_obj: &dyn NodeAny = unsafe { std::mem::transmute((self.data, self.vtable)) };
-
-        trait_obj.as_any()
+        &*self.data.as_ref().unwrap().value
     }
 }
-
-impl<'a> std::ops::DerefMut for RefMutAny<'a> {
-    fn deref_mut(&mut self) -> &mut dyn Any {
-        let trait_obj: &mut dyn NodeAny = unsafe { std::mem::transmute((self.data, self.vtable)) };
-
-        trait_obj.as_any_mut()
+impl DerefMut for RefMutAny<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut *self.data.as_mut().unwrap().value
     }
 }
-
-impl<'a> Drop for RefMutAny<'a> {
+impl Drop for RefMutAny<'_> {
     fn drop(&mut self) {
-        assert_eq!(unsafe { *self.used }, true);
-
-        unsafe {
-            *self.used = false;
+        if let Some(data) = self.data.take() {
+            // Only this guard can fill the empty slot. Move the previous value
+            // out so an invariant failure never drops user data in a borrow.
+            let previous = self.entry.data.replace(Some(data));
+            assert!(previous.is_none(), "node already has a value");
         }
+        // If detached, dropping our final Rc destroys the restored value.
     }
 }
 
-struct Cell {
-    id: Id,
-    data: *mut (),
-    vtable: *mut (),
+struct NodeData {
+    value: Box<dyn Any>,
     capabilities: Vec<Box<dyn Any>>,
-    ready: *const fn(RefMut<()>),
-    update: *const fn(RefMut<()>),
-    fixed_update: *const fn(RefMut<()>),
-    draw: *const fn(RefMut<()>),
-    virtual_drop: *const fn(*mut ()),
+}
+#[derive(Clone, Copy)]
+struct Callbacks {
+    ready: fn(RefMutAny<'static>),
+    update: fn(RefMutAny<'static>),
+    fixed_update: fn(RefMutAny<'static>),
+    draw: fn(RefMutAny<'static>),
+}
+struct NodeEntry {
+    id: Id,
+    data: RefCell<Option<NodeData>>,
+    permanent: Cell<bool>,
+    initialized: Cell<bool>,
+    callbacks: Callbacks,
     data_len: usize,
-    permanent: bool,
-    initialized: bool,
-    used: *mut bool,
 }
-
-unsafe impl Sync for Scene {}
-
-fn virtual_drop<T: Node + 'static>(data: *mut ()) {
-    unsafe {
-        std::ptr::drop_in_place(data as *mut T);
-    }
-}
-
-impl Cell {
-    fn new<T: Node + 'static>(id: Id, data: *mut (), vtable: *mut (), used: *mut bool) -> Self {
-        Cell {
+impl NodeEntry {
+    fn new<T: Node + 'static>(id: Id, value: T) -> Self {
+        Self {
             id,
-            data,
-            vtable,
-            capabilities: vec![],
-            used,
-            permanent: false,
-            ready: (&(Node::ready as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast(),
-            update: (&(Node::update as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast(),
-            fixed_update: (&(Node::fixed_update as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast(),
-            draw: (&(Node::draw as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast(),
-            virtual_drop: &(virtual_drop::<T> as fn(*mut ())) as *const fn(*mut ()),
+            data: RefCell::new(Some(NodeData {
+                value: Box::new(value),
+                capabilities: vec![],
+            })),
+            permanent: Cell::new(false),
+            initialized: Cell::new(false),
+            callbacks: Callbacks {
+                ready: |node| T::ready(node.to_typed()),
+                update: |node| T::update(node.to_typed()),
+                fixed_update: |node| T::fixed_update(node.to_typed()),
+                draw: |node| T::draw(node.to_typed()),
+            },
             data_len: size_of::<T>(),
-            initialized: false,
         }
     }
+    fn borrow(self: &Rc<Self>) -> Option<RefMutAny<'static>> {
+        let data = self.data.borrow_mut().take()?;
+        Some(RefMutAny {
+            data: Some(data),
+            entry: Rc::clone(self),
+            handle: HandleUntyped(self.id),
+            _marker: PhantomData,
+        })
+    }
+    fn is_borrowed(&self) -> bool {
+        self.data.borrow().is_none()
+    }
+}
 
-    fn update<T: Node + 'static>(&mut self, data: T) {
-        assert!(size_of::<T>() <= self.data_len);
+static NEXT_SCENE_ID: AtomicU64 = AtomicU64::new(1);
 
-        let trait_obj = &data as &dyn NodeAny;
-        let (_, vtable) = unsafe { std::mem::transmute::<_, (*mut (), *mut ())>(trait_obj) };
-
-        self.vtable = vtable;
-        self.ready = (&(Node::ready as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast();
-        self.update = (&(Node::update as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast();
-        self.fixed_update = (&(Node::fixed_update as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast();
-        self.draw = (&(Node::draw as fn(RefMut<T>)) as *const fn(RefMut<T>)).cast();
-        self.virtual_drop = &(virtual_drop::<T> as fn(*mut ())) as *const fn(*mut ());
-
-        unsafe {
-            std::ptr::copy_nonoverlapping::<T>(&data as *const _ as *mut _, self.data as *mut _, 1);
+fn next_scene_id() -> u64 {
+    let mut id = NEXT_SCENE_ID.load(Ordering::Relaxed);
+    loop {
+        let next = id.checked_add(1).expect("scene identity exhausted");
+        match NEXT_SCENE_ID.compare_exchange_weak(id, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return id,
+            Err(current) => id = current,
         }
-        self.id.generation += 1;
-        self.initialized = false;
-        self.permanent = false;
-
-        self.capabilities.clear();
-
-        std::mem::forget(data);
     }
 }
 
 struct Scene {
+    id: u64,
+    owner: ThreadId,
     dense: Vec<Id>,
-    dense_ongoing: Vec<Result<Id, Id>>,
-    nodes: Vec<Option<Cell>>,
-    arena: arena::Arena,
-    camera: [Option<Camera2D>; 4],
+    nodes: Vec<Option<Rc<NodeEntry>>>,
+    free_slots: Vec<Id>,
+    camera: [Option<Rc<Camera2D>>; 4],
     camera_pos: crate::Vec2,
-
     acc: f64,
     current_time: f64,
     in_fixed_update: bool,
-
-    any_map: std::collections::HashMap<std::any::TypeId, Vec<(HandleUntyped, *mut u8)>>,
-    free_nodes: Vec<Cell>,
 }
-
 impl Scene {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self::new_at(crate::time::get_time())
     }
-
     fn new_at(now: f64) -> Self {
-        Scene {
+        let id = next_scene_id();
+        Self {
+            id,
+            owner: std::thread::current().id(),
             dense: vec![],
-            dense_ongoing: vec![],
-            nodes: Vec::new(),
-            arena: arena::Arena::new(),
-            free_nodes: Vec::new(),
-            camera: [Some(Camera2D::default()), None, None, None],
+            nodes: vec![],
+            free_slots: vec![],
+            camera: [Some(Rc::new(Camera2D::default())), None, None, None],
             camera_pos: crate::vec2(0., 0.),
             acc: 0.0,
             current_time: now,
             in_fixed_update: false,
-            any_map: std::collections::HashMap::new(),
         }
     }
-
-    pub fn clear(&mut self) {
-        self.any_map.clear();
-
-        for cell in &mut self.nodes {
-            if let Some(Cell {
-                permanent: false, ..
-            }) = cell
-            {
-                if let Some(cell) = cell.take() {
-                    assert!(unsafe { *cell.used == false });
-
-                    unsafe {
-                        (*cell.virtual_drop)(cell.data);
+    fn assert_owner(&self) {
+        assert_eq!(
+            self.owner,
+            std::thread::current().id(),
+            "scene accessed from another thread"
+        );
+    }
+    fn check_clear(&self) {
+        self.assert_owner();
+        assert!(
+            self.nodes
+                .iter()
+                .flatten()
+                .all(|entry| entry.permanent.get() || !entry.is_borrowed()),
+            "cannot clear a borrowed node"
+        );
+    }
+    // Return detached entries: callers drop them AFTER releasing the registry.
+    fn clear(&mut self) -> Vec<Rc<NodeEntry>> {
+        self.check_clear();
+        let mut removed = Vec::new();
+        for slot in &mut self.nodes {
+            if slot.as_ref().is_some_and(|entry| !entry.permanent.get()) {
+                let entry = slot.take().unwrap();
+                self.free_slots.push(entry.id);
+                removed.push(entry);
+            }
+        }
+        self.dense.retain(|id| self.nodes[id.id].is_some());
+        removed
+    }
+    fn entry(&self, id: Id) -> Option<&Rc<NodeEntry>> {
+        if self.owner != std::thread::current().id() || id.scene != self.id {
+            return None;
+        }
+        let entry = self.nodes.get(id.id)?.as_ref()?;
+        (entry.id == id).then_some(entry)
+    }
+    fn get_any(&self, handle: HandleUntyped) -> Option<RefMutAny<'static>> {
+        self.entry(handle.0)?.borrow()
+    }
+    fn get<T>(&self, handle: Handle<T>) -> Option<RefMut<T>> {
+        let node = self.get_any(HandleUntyped(handle.id?))?;
+        if !node.is::<T>() {
+            return None;
+        }
+        Some(node.to_typed())
+    }
+    fn iter(&self) -> MagicVecIterator {
+        self.assert_owner();
+        MagicVecIterator {
+            ids: self.dense.clone().into_iter(),
+        }
+    }
+    fn add_node<T: Node + 'static>(&mut self, data: T) -> Handle<T> {
+        self.assert_owner();
+        // Exhausted generations retire slots instead of reviving old handles.
+        let id = loop {
+            match self.free_slots.pop() {
+                Some(old) => {
+                    if let Some(generation) = old.generation.checked_add(1) {
+                        break Id { generation, ..old };
                     }
-                    let ix = self.dense.iter().position(|i| *i == cell.id).unwrap();
-                    self.dense.remove(ix);
-
-                    self.free_nodes.push(cell);
+                }
+                None => {
+                    let id = Id {
+                        scene: self.id,
+                        id: self.nodes.len(),
+                        generation: 0,
+                    };
+                    self.nodes.push(None);
+                    break id;
                 }
             }
-        }
-    }
-
-    pub fn get_any(&mut self, handle: HandleUntyped) -> Option<RefMutAny<'_>> {
-        let handle = handle.0;
-        let cell = self.nodes.get_mut(handle.id)?;
-
-        if cell.is_none() {
-            return None;
-        }
-        let cell = cell.as_mut().unwrap();
-
-        if cell.id.generation != handle.generation {
-            return None;
-        }
-
-        if unsafe { *cell.used } {
-            return None;
-        }
-
-        unsafe { *cell.used = true };
-
-        Some(RefMutAny {
-            data: cell.data,
-            vtable: cell.vtable,
-            capabilities: &mut cell.capabilities as _,
-            handle: HandleUntyped(cell.id),
-            used: cell.used,
-
-            _marker: PhantomData,
-        })
-    }
-
-    pub fn get<T>(&mut self, handle: Handle<T>) -> Option<RefMut<T>> {
-        let ref_mut_any = self.get_any(HandleUntyped(handle.id?))?;
-        Some(ref_mut_any.to_typed())
-    }
-
-    fn iter(&self) -> MagicVecIterator {
-        MagicVecIterator {
-            n: 0,
-            len: self.dense.len(),
-        }
-    }
-
-    fn add_node<T: Node + 'static>(&mut self, data: T) -> Handle<T> {
-        let id;
-
-        if let Some(i) = self
-            .free_nodes
-            .iter()
-            .position(|free_node| free_node.data_len >= size_of::<T>())
-        {
-            let mut free_node = self.free_nodes.remove(i);
-
-            free_node.update::<T>(data);
-
-            id = free_node.id;
-
-            self.nodes[id.id] = Some(free_node);
-        } else {
-            let trait_obj = &data as &dyn NodeAny;
-            let (_, vtable) = unsafe { std::mem::transmute::<_, (*mut (), *mut ())>(trait_obj) };
-
-            let ptr = self.arena.alloc(size_of::<T>()) as *mut _ as *mut T;
-            unsafe {
-                std::ptr::write(ptr, data);
-            }
-            let ptr = ptr as *mut ();
-            let used = self.arena.alloc(1) as *mut _ as *mut bool;
-            unsafe {
-                std::ptr::write(used, false);
-            }
-            let used = used as *mut _ as *mut bool;
-
-            id = Id {
-                id: self.nodes.len(),
-                generation: 0,
-            };
-            self.nodes.push(Some(Cell::new::<T>(id, ptr, vtable, used)));
-        }
-
+        };
+        self.nodes[id.id] = Some(Rc::new(NodeEntry::new(id, data)));
         self.dense.push(id);
-
         Handle {
             id: Some(id),
             _marker: PhantomData,
         }
     }
-
-    pub fn delete(&mut self, id: Id) {
-        if let Some(node) = self.nodes[id.id].take() {
-            assert_eq!(node.id.generation, id.generation);
-
-            self.dense_ongoing.push(Err(id));
-
-            unsafe {
-                (*node.virtual_drop)(node.data);
-            }
-            self.free_nodes.push(node);
-        }
+    fn delete(&mut self, id: Id) -> Option<Rc<NodeEntry>> {
+        self.assert_owner();
+        let entry = self.entry(id)?;
+        assert!(!entry.is_borrowed(), "cannot delete a borrowed node");
+        let removed = self.nodes[id.id].take();
+        self.dense.retain(|current| *current != id);
+        self.free_slots.push(id);
+        removed
     }
-
-    pub fn update(&mut self) {
-        self.update_with(
-            crate::time::get_time,
-            |camera| {
-                crate::prelude::push_camera_state();
-                crate::prelude::set_camera(camera);
-            },
-            crate::prelude::pop_camera_state,
-        );
-    }
-
-    // Keep clock sampling after ready callbacks, as in the production loop.
-    // Explicit clock/camera inputs also allow headless scheduling regression tests.
-    // This does not yet change the global borrowing or callback ownership model.
-    fn update_with(
-        &mut self,
-        clock: impl FnOnce() -> f64,
-        mut push_camera: impl FnMut(&Camera2D),
-        mut pop_camera: impl FnMut(),
-    ) {
-        for node in &mut self.iter() {
-            let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
-            if cell.initialized == false {
-                cell.initialized = true;
-
-                let node: RefMut<()> = node.to_typed::<()>();
-                unsafe { (*cell.ready)(node) };
-            }
-        }
-
-        let new_time = clock();
-
+    fn advance_time(&mut self, new_time: f64) {
         let mut frame_time = new_time - self.current_time;
-
-        // https://medium.com/@tglaiel/how-to-make-your-game-run-at-60fps-24c61210fe75x
+        // Preserve legacy refresh-interval snapping and the strict fixed boundary.
         if (frame_time - 1.0 / 120.0).abs() < 0.0002 {
             frame_time = 1.0 / 120.0;
         } else if (frame_time - 1.0 / 60.0).abs() < 0.0002 {
@@ -523,184 +390,167 @@ impl Scene {
         } else if (frame_time - 1.0 / 30.0).abs() < 0.0002 {
             frame_time = 1.0 / 30.0;
         }
-
         self.current_time = new_time;
         self.acc += frame_time;
-
-        for node in &mut self.iter() {
-            let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
-            let node: RefMut<()> = node.to_typed::<()>();
-            unsafe { (*cell.update)(node) };
-        }
-
-        while self.acc > CONST_FPS {
-            self.acc -= CONST_FPS;
-            for node in &mut self.iter() {
-                let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
-                let node: RefMut<()> = node.to_typed::<()>();
-
-                self.in_fixed_update = true;
-                unsafe { (*cell.fixed_update)(node) };
-                self.in_fixed_update = false;
-            }
-        }
-
-        for camera in self.camera.iter() {
-            if let Some(camera) = camera {
-                self.camera_pos = camera.target;
-                push_camera(camera);
-
-                for node in &mut self.iter() {
-                    let cell = self.nodes[node.handle.0.id].as_mut().unwrap();
-                    let node: RefMut<()> = node.to_typed::<()>();
-                    unsafe { (*cell.draw)(node) };
-                }
-
-                pop_camera();
-            }
-        }
-
-        for id in self.dense_ongoing.drain(0..) {
-            match id {
-                Ok(id) => {
-                    self.dense.push(id);
-                }
-                Err(id) => {
-                    let ix = self.dense.iter().position(|i| *i == id).unwrap();
-                    self.dense.remove(ix);
-                }
-            }
-        }
     }
 }
 
+/// Snapshots identities. Additions are excluded; deleted/reused slots and nodes
+/// currently borrowed by another guard are skipped.
 pub struct MagicVecIterator {
-    n: usize,
-    len: usize,
+    ids: std::vec::IntoIter<Id>,
 }
-
 impl Iterator for MagicVecIterator {
     type Item = RefMutAny<'static>;
-
-    fn next(&mut self) -> Option<RefMutAny<'static>> {
-        let scene = unsafe { get_scene() };
-        let nodes = &mut scene.nodes;
-        let dense = &scene.dense;
-        if self.n >= self.len {
-            return None;
+    fn next(&mut self) -> Option<Self::Item> {
+        for id in self.ids.by_ref() {
+            if let Some(node) = get_untyped_node(HandleUntyped(id)) {
+                return Some(node);
+            }
         }
-        let ix = dense[self.n];
-        let cell = &mut nodes[ix.id];
-        self.n += 1;
-
-        if cell.is_none() {
-            return self.next();
-        }
-        let cell = cell.as_mut().unwrap();
-
-        if unsafe { *cell.used } {
-            return self.next();
-        }
-
-        unsafe { *cell.used = true };
-
-        Some(RefMutAny {
-            data: cell.data,
-            vtable: cell.vtable,
-            capabilities: &mut cell.capabilities as _,
-            handle: HandleUntyped(cell.id),
-            used: cell.used,
-            _marker: PhantomData,
-        })
+        None
     }
 }
 
 static mut SCENE: Option<Scene> = None;
 
+// Step 3 replaces this legacy global with scoped thread-local storage.
+// Owned guards never contain references into this registry.
 unsafe fn get_scene() -> &'static mut Scene {
-    SCENE.get_or_insert_with(|| Scene::new())
+    SCENE.get_or_insert_with(Scene::new)
 }
 
 pub(crate) fn allocated_memory() -> usize {
-    unsafe { get_scene().arena.offset() }
-}
-
-pub fn clear() {
-    crate::experimental::coroutines::stop_all_coroutines();
-
-    unsafe { get_scene() }.clear()
-}
-
-/// Get node and panic if the node is borrowed or deleted
-pub fn get_node<T: Node>(handle: Handle<T>) -> RefMut<T> {
     unsafe { get_scene() }
-        .get(handle)
-        .expect(&format!("No such node: {:?}", handle.id))
+        .nodes
+        .iter()
+        .flatten()
+        .map(|node| node.data_len)
+        .sum()
+}
+pub fn clear() {
+    unsafe { get_scene() }.check_clear();
+    crate::experimental::coroutines::stop_all_coroutines();
+    clear_nodes();
+}
+fn clear_nodes() {
+    let removed = unsafe { get_scene() }.clear();
+    drop(removed);
 }
 
+/// Get a node; panic if its handle is foreign, stale, wrongly typed, or borrowed.
+pub fn get_node<T: Node>(handle: Handle<T>) -> RefMut<T> {
+    try_get_node(handle).unwrap_or_else(|| panic!("No such node: {:?}", handle.id))
+}
 pub fn try_get_node<T: Node>(handle: Handle<T>) -> Option<RefMut<T>> {
     unsafe { get_scene() }.get(handle)
 }
-
 pub fn get_untyped_node(handle: HandleUntyped) -> Option<RefMutAny<'static>> {
     unsafe { get_scene() }.get_any(handle)
 }
-
 pub fn camera_pos() -> crate::Vec2 {
     unsafe { get_scene() }.camera_pos
 }
-
 pub fn set_camera(n: usize, camera: Option<Camera2D>) {
     assert!(n <= 4);
-    unsafe { get_scene() }.camera[n] = camera;
+    let previous = std::mem::replace(&mut unsafe { get_scene() }.camera[n], camera.map(Rc::new));
+    drop(previous);
 }
-
 pub fn add_node<T: Node>(node: T) -> Handle<T> {
     unsafe { get_scene() }.add_node(node)
 }
-
 pub(crate) fn update() {
-    unsafe { get_scene() }.update()
+    update_with(
+        crate::time::get_time,
+        |camera| {
+            crate::prelude::push_camera_state();
+            crate::prelude::set_camera(camera);
+        },
+        crate::prelude::pop_camera_state,
+    );
 }
 
+// Dispatch without a registry borrow, including destructors triggered by a
+// callback. Keep separate per-pass snapshots and legacy addition eligibility.
+fn update_with(
+    clock: impl FnOnce() -> f64,
+    mut push_camera: impl FnMut(&Camera2D),
+    mut pop_camera: impl FnMut(),
+) {
+    for node in all_nodes() {
+        if !node.entry.initialized.replace(true) {
+            let ready = node.entry.callbacks.ready;
+            ready(node);
+        }
+    }
+    let now = clock();
+    unsafe { get_scene() }.advance_time(now);
+    for node in all_nodes() {
+        let update = node.entry.callbacks.update;
+        update(node);
+    }
+    loop {
+        let run_fixed = {
+            let scene = unsafe { get_scene() };
+            if scene.acc > CONST_FPS {
+                scene.acc -= CONST_FPS;
+                true
+            } else {
+                false
+            }
+        };
+        if !run_fixed {
+            break;
+        }
+        for node in all_nodes() {
+            let fixed_update = node.entry.callbacks.fixed_update;
+            unsafe { get_scene() }.in_fixed_update = true;
+            fixed_update(node);
+            unsafe { get_scene() }.in_fixed_update = false;
+        }
+    }
+    for n in 0..4 {
+        let camera = unsafe { get_scene() }.camera[n].clone();
+        if let Some(camera) = camera {
+            unsafe { get_scene() }.camera_pos = camera.target;
+            push_camera(&camera);
+            for node in all_nodes() {
+                let draw = node.entry.callbacks.draw;
+                draw(node);
+            }
+            pop_camera();
+        }
+    }
+}
 pub fn all_nodes() -> MagicVecIterator {
     unsafe { get_scene() }.iter()
 }
-
 pub fn find_node_by_type<T: Any>() -> Option<RefMut<T>> {
-    unsafe { get_scene() }
-        .iter()
-        .find(|node| node.is::<T>())
-        .map(|node| node.to_typed())
+    find_nodes_by_type().next()
 }
-
 pub fn find_nodes_with<T: Any + Copy>() -> impl Iterator<Item = NodeWith<T>> {
-    unsafe {
-        get_scene().iter().filter_map(|node| {
-            (*node.capabilities)
-                .iter()
-                .find(|capability| capability.is::<T>())
-                .map(|capability| NodeWith {
-                    node: node.handle,
-                    capability: *capability.downcast_ref::<T>().unwrap(),
-                })
-        })
-    }
+    all_nodes().filter_map(|node| {
+        node.data
+            .as_ref()
+            .unwrap()
+            .capabilities
+            .iter()
+            .find_map(|capability| capability.downcast_ref::<T>())
+            .map(|capability| NodeWith {
+                node: HandleUntyped(node.entry.id),
+                capability: *capability,
+            })
+    })
 }
-
 pub fn find_nodes_by_type<T: Any>() -> impl Iterator<Item = RefMut<T>> {
-    unsafe { get_scene() }
-        .iter()
+    all_nodes()
         .filter(|node| node.is::<T>())
         .map(|node| node.to_typed())
 }
-
 const CONST_FPS: f64 = 1.0 / 60.;
-
 pub(crate) fn in_fixed_update() -> bool {
     unsafe { get_scene() }.in_fixed_update
 }
-
 pub(crate) const fn fixed_frame_time() -> f32 {
     CONST_FPS as _
 }

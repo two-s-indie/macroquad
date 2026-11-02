@@ -272,47 +272,44 @@ pub mod tweens {
         task::{Context, Poll},
     };
 
-    pub struct LinearTweenFuture<T>
+    /// A tween retaining its typed projection until completion. The node and
+    /// projection types are inferred by `linear`; no node guard crosses a poll.
+    pub struct LinearTweenFuture<T, T1: 'static, F>
     where
         T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
     {
         from: T,
         to: T,
-        lens: Lens<T>,
+        lens: Lens<T1, T, F>,
         start_time: f64,
         time: f32,
     }
-    impl<T> Unpin for LinearTweenFuture<T> where
+    impl<T, T1, F> Unpin for LinearTweenFuture<T, T1, F> where
         T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>
     {
     }
 
-    impl<T> Future for LinearTweenFuture<T>
+    impl<T, T1, F> Future for LinearTweenFuture<T, T1, F>
     where
         T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
+        F: for<'r> FnMut(&'r mut T1) -> &'r mut T,
     {
         type Output = ();
 
         fn poll(self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
             let t = (miniquad::date::now() - self.start_time) / self.time as f64;
             let this = self.get_mut();
-            let var = this.lens.get();
-
-            // node with value was deleted
-            if var.is_none() {
-                return Poll::Ready(());
-            }
-            let var = var.unwrap();
-
-            if t <= 1. {
-                *var = this.from + (this.to - this.from) * t as f32;
-
-                Poll::Pending
-            } else {
-                *var = this.to;
-
-                Poll::Ready(())
-            }
+            this.lens
+                .with(|var| {
+                    if t <= 1. {
+                        *var = this.from + (this.to - this.from) * t as f32;
+                        Poll::Pending
+                    } else {
+                        *var = this.to;
+                        Poll::Ready(())
+                    }
+                })
+                .unwrap_or(Poll::Ready(()))
         }
     }
 
@@ -322,7 +319,7 @@ pub mod tweens {
         from: T,
         to: T,
         time: f32,
-    ) -> LinearTweenFuture<T>
+    ) -> LinearTweenFuture<T, T1, F>
     where
         T: Copy + Add<Output = T> + Sub<Output = T> + Mul<f32, Output = T>,
         T1: Node,

@@ -299,6 +299,9 @@ pub struct GpuQuery {
     pub force_resume: bool,
 }
 
+/// Sum of the inline sizes of registered scene nodes, including borrowed nodes.
+/// Excludes registry/guard overhead, capabilities, allocations owned by node
+/// fields, and detached nodes retained by guards from a previous scene.
 pub fn scene_allocated_memory() -> usize {
     use crate::experimental::scene;
 

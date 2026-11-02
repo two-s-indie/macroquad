@@ -12,6 +12,18 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 2 of the scene safety plan: replace the raw arena and borrowed
+  registry pointers with typed allocations and owned guards. Validate node type,
+  scene identity, and generation; reject conflicting clear/delete operations
+  before mutation. Snapshot iterator identities to prevent stale-slot reuse and
+  duplicate visits. Drop removed nodes outside registry access, including deletion
+  from callbacks, and replace unchecked callback casts with typed adapters.
+  All five previously ignored scene defect tests now pass; add coverage for guard
+  survival, capabilities, alignment, destructor reentry, and scoped projections.
+- Replace tween field offsets derived from uninitialized nodes with retained
+  typed projections under parent guards. Field access cannot outlive its guard,
+  and polling releases the node on return or panic. Preserve borrowed projections
+  in `follow_path` and sendable handles for non-`Send` nodes.
 - Replace the profiler's mutable global with thread-local `RefCell` storage and
   scoped borrows, removing its `static_mut_refs` warning while preserving the
   public telemetry API. Avoid nested profiler access during frame reset and
@@ -37,6 +49,11 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Changed
 
+- The explicit tween type is now `LinearTweenFuture<T, T1, F>`; inferred
+  `linear(...)` calls remain supported. Projection closures are retained and run
+  each poll, so their captures determine the future's lifetime and `Send` bounds.
+- Scene memory telemetry now reports the sum of registered nodes' inline sizes
+  instead of an arena offset; it excludes registry overhead and nested allocations.
 - Establish the scene safety baseline with internal clock/camera inputs for
   headless tests, preserving production callback ordering and timing. Add nine
   characterization tests and five ignored acceptance tests reproducing known
