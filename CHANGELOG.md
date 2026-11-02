@@ -12,6 +12,12 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Replace the experimental storage's mutable global with thread-local storage
+  and owned borrow guards, removing its six `static_mut_refs` warnings without
+  adding unsafe code. Preserve the `store`/`get`/`get_mut` API and runtime borrow
+  checks; guards now keep replaced values alive until released. Stored values
+  are isolated per thread and owned by its storage. Drop replaced values
+  outside the map borrow so their destructors can access storage.
 - Protect the registered Macroquad thread ID with an `RwLock`, removing its
   `static_mut_refs` warning and unsafe global access while preserving thread
   reassignment during window/test initialization. Add regression coverage for
