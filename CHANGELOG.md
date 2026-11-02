@@ -12,6 +12,15 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 3 of the scene safety plan: replace the scene mutable global
+  with scoped thread-local storage, removing its `static_mut_refs` warning.
+  Restore dispatch/fixed flags and camera state on unwind; run scene callbacks
+  outside the whole-context frame borrow and within user-code panic recovery.
+  Initialize scene sessions explicitly, reject foreign/stale handles, and clean
+  up on completion and accepted quit before backend teardown. Add headless and
+  real-rendering lifecycle tests; four `CONTEXT` warnings remain.
+- Detach explicitly canceled coroutines before dropping their futures, allowing
+  cancellation destructors to reenter the scene and schedule/stop coroutines.
 - Complete step 2 of the scene safety plan: replace the raw arena and borrowed
   registry pointers with typed allocations and owned guards. Validate node type,
   scene identity, and generation; reject conflicting clear/delete operations
@@ -49,6 +58,13 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Changed
 
+- Nodes created during scene callbacks now begin callbacks next frame, with
+  `ready()` before update/fixed/draw. A guard blocking ready also blocks later
+  callbacks that frame. Clearing still preserves persistent nodes; session
+  shutdown removes all nodes. Optional access to an inactive scene returns
+  absence/defaults instead of implicitly constructing a scene.
+- Coroutine stopping cancels the current snapshot; futures created by its
+  destructors remain scheduled. Full scheduler/context migration is still pending.
 - The explicit tween type is now `LinearTweenFuture<T, T1, F>`; inferred
   `linear(...)` calls remain supported. Projection closures are retained and run
   each poll, so their captures determine the future's lifetime and `Send` bounds.

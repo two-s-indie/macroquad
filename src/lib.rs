@@ -446,8 +446,6 @@ impl Context {
     }
 
     fn end_frame(&mut self) {
-        crate::experimental::scene::update();
-
         self.perform_render_passes();
 
         self.ui_context.draw(get_quad_context(), &mut self.gl);
@@ -548,6 +546,31 @@ fn get_quad_context() -> &'static mut dyn miniquad::RenderingBackend {
 
 struct Stage {
     main_future: Pin<Box<dyn Future<Output = ()>>>,
+}
+
+impl Stage {
+    fn shutdown(&mut self) {
+        // Normal completion/accepted quit clean up before backend teardown.
+        // Also finish scene cleanup if dropping the main future unwinds.
+        struct ShutdownScene;
+        impl Drop for ShutdownScene {
+            fn drop(&mut self) {
+                crate::experimental::scene::shutdown();
+            }
+        }
+        let _shutdown = ShutdownScene;
+        let future = std::mem::replace(&mut self.main_future, Box::pin(async {}));
+        drop(future);
+    }
+}
+
+impl Drop for Stage {
+    fn drop(&mut self) {
+        // Fallback for unwinding or backend exit without a quit event. Backend
+        // availability on this path is platform-dependent; normal exits clean
+        // up explicitly before reaching here.
+        self.shutdown();
+    }
 }
 
 impl EventHandler for Stage {
@@ -822,6 +845,10 @@ impl EventHandler for Stage {
                         return;
                     }
                     get_context().coroutines_context.update();
+                    // Scene callbacks may use timing, cameras, and drawing APIs.
+                    // Dispatch outside Context::end_frame's exclusive borrow and
+                    // inside the same panic-recovery boundary as other user code.
+                    crate::experimental::scene::update();
                 }),
             );
 
@@ -897,10 +924,11 @@ impl EventHandler for Stage {
     }
 
     fn quit_requested_event(&mut self) {
-        let context = get_context();
-        if context.prevent_quit_event {
+        if get_context().prevent_quit_event {
             miniquad::window::cancel_quit();
-            context.quit_requested = true;
+            get_context().quit_requested = true;
+        } else {
+            self.shutdown();
         }
     }
 }
@@ -1000,10 +1028,12 @@ impl Window {
                 draw_call_index_capacity,
             );
             unsafe { CONTEXT = Some(context) };
+            crate::experimental::scene::initialize(crate::time::get_time());
 
             Box::new(Stage {
                 main_future: Box::pin(async {
                     future.await;
+                    crate::experimental::scene::shutdown();
                     unsafe {
                         if let Some(ctx) = CONTEXT.as_mut() {
                             ctx.gl.reset();

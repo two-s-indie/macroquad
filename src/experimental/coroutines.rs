@@ -221,16 +221,21 @@ pub fn start_coroutine<T: 'static + Any>(
     }
 }
 
+/// Cancel the currently registered coroutines. Destructors run after detaching
+/// that snapshot; coroutines they create remain scheduled.
 pub fn stop_all_coroutines() {
-    let context = &mut get_context().coroutines_context;
-
-    context.coroutines.clear();
+    let removed = get_context().coroutines_context.coroutines.take_all();
+    // Futures can access the scene or schedule/cancel coroutines in Drop.
+    // Release our context access before running their destructors.
+    drop(removed);
 }
 
 pub fn stop_coroutine<T: 'static + Any>(coroutine: Coroutine<T>) {
-    let context = &mut get_context().coroutines_context;
-
-    context.coroutines.free(coroutine.id);
+    let removed = get_context()
+        .coroutines_context
+        .coroutines
+        .take(coroutine.id);
+    drop(removed);
 }
 
 pub struct TimerDelayFuture {

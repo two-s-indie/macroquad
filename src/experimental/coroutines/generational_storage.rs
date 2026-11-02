@@ -26,7 +26,7 @@ mod tests {
     fn cleared_handles_can_be_queried_and_freed() {
         let mut storage = GenerationalStorage::new();
         let old = storage.push(1);
-        storage.clear();
+        drop(storage.take_all());
 
         assert!(storage.get(old).is_none());
         assert!(storage.get_mut(old).is_none());
@@ -39,8 +39,8 @@ mod tests {
         let mut storage = GenerationalStorage::new();
         let old = [storage.push(1), storage.push(2), storage.push(3)];
         storage.free(old[1]);
-        storage.clear();
-        storage.clear();
+        drop(storage.take_all());
+        drop(storage.take_all());
 
         let current = [storage.push(4), storage.push(5), storage.push(6)];
         for id in old {
@@ -155,19 +155,30 @@ impl<T> GenerationalStorage<T> {
         self.vec.iter().filter(|c| c.is_some()).count()
     }
 
-    pub fn clear(&mut self) {
-        // Preserve each slot's generation so clearing cannot revive old handles.
-        self.retain(|_| false);
+    /// Detach values without running their destructors under the caller's borrow.
+    pub fn take_all(&mut self) -> Vec<T> {
+        let mut removed = Vec::new();
+        for (id, slot) in self.vec.iter_mut().enumerate() {
+            if let Some(cell) = slot.take() {
+                self.free_indices.push((id, cell.generation));
+                removed.push(cell.state);
+            }
+        }
+        removed
     }
 
     pub fn free(&mut self, id: GenerationalId) {
+        drop(self.take(id));
+    }
+
+    pub fn take(&mut self, id: GenerationalId) -> Option<T> {
         // Finished, stopped, and outdated handles must all be harmless to free.
         if self.get(id).is_none() {
-            return;
+            return None;
         }
 
         self.free_indices.push((id.id, id.generation));
-        self.vec[id.id] = None;
+        self.vec[id.id].take().map(|cell| cell.state)
     }
 
     pub(crate) fn allocated_memory(&self) -> usize {

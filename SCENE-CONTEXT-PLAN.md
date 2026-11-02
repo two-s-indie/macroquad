@@ -4,10 +4,10 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-The latest verified `cargo build` reports five `static_mut_refs` warnings:
-one from `SCENE` and four from `CONTEXT`. The `THREAD_ID`, `STORAGE`, and
-`PROFILER` changes are already implemented. Steps 1 and 2 are complete; neither remaining
-subsystem is yet declared safe. The warning count is unchanged.
+Steps 1 through 3 are complete. `SCENE` now uses scoped thread-local storage;
+its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
+The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
+The overall engine/context migration is not yet complete.
 
 ## Working rules
 
@@ -113,21 +113,45 @@ not executed; Miri is still unavailable.
 - [x] Refactor scene update into short registry operations and callback dispatch.
   Acquire the node guard and callback information, release the registry borrow,
   invoke user code, then reconcile pending changes.
-- [ ] Preserve callback ordering, fixed-step timing, and camera selection. Review
+- [x] Preserve callback ordering, fixed-step timing, and camera selection. Review
   the audit's early-draw-before-ready behavior and explicitly document any
   correction to callback eligibility for newly added nodes.
-- [ ] Ensure coroutine cancellation from scene clearing and node destructors
+- [x] Ensure coroutine cancellation from scene clearing and node destructors
   happens outside scene registry borrows.
-- [ ] Replace `static mut SCENE` and `get_scene() -> &'static mut Scene` with
+- [x] Replace `static mut SCENE` and `get_scene() -> &'static mut Scene` with
   thread-local, scoped access using the ownership model from step 2. Remove the
   unsupported blanket `unsafe impl Sync for Scene` if it is no longer needed.
-- [ ] Keep time/context reads outside scene borrows where they could re-enter
+- [x] Keep time/context reads outside scene borrows where they could re-enter
   the scene. Define initialization and shutdown order explicitly.
 
 Acceptance: scene callbacks can access other nodes, spawn/delete nodes, use
 camera and timing APIs, and unwind without leaving borrowing state stuck.
 Scene tests and relevant examples pass; the `SCENE` warning is gone. Four
 `CONTEXT` warnings may still remain.
+
+Outcome: scene access is scoped through `thread_local!`/`RefCell`; no unrestricted
+scene reference or unsafe code remains in the scene module. Per-frame ID
+snapshots defer callback-created nodes to next frame, and ready-blocked nodes
+cannot run later callbacks early. Ordering and strict fixed-step timing remain.
+RAII restores dispatch/fixed flags and camera pushes on unwind. Scene dispatch
+now runs outside `Context::end_frame`, inside the user-code recovery boundary.
+
+Initialization occurs after context installation; completion and accepted quit
+cancel coroutines, detach the registry, and drop nodes/cameras before backend
+teardown. Cancellation detaches its current snapshot before dropping futures.
+Repeated headless sessions and foreign-thread handles are tested; optional lookup
+after shutdown/TLS teardown does not recreate a scene. Full context, coroutine
+polling, and resource lifecycle work remains in part two. Backend exits that bypass
+normal completion/accepted quit have platform-dependent cleanup timing.
+
+Validation: 61 library tests pass, including 37 scene tests. The real-backend
+scene integration test passes both completion and accepted-quit scenarios with
+render-target pixel checks and GPU access during node destruction. Miniquad's
+native display cannot initialize twice in one process, so graphics scenarios
+run in separate processes; headless tests verify repeated scene initialization.
+All three coroutine tests pass individually. `cargo build`, all-target checking,
+WebAssembly library checking, formatting, and whitespace checks pass. Examples
+were compiled, not run. See the audit for details and remaining limitations.
 
 ## Part two CONTEXT
 
@@ -176,7 +200,7 @@ destruction, exact-once disposal, and shutdown/session boundaries.
 
 ### 6 Move callbacks and future polling outside context borrows
 
-- [ ] Invoke scene updates outside any whole-context borrow.
+- [x] Invoke scene updates outside any whole-context borrow (moved in step 3).
 - [ ] Refactor coroutine scheduling so polling a future holds neither the whole
   context nor an exclusive scheduler borrow that callbacks need to reacquire.
 - [ ] Preserve coroutine insertion, cancellation, completion, and manual timing
@@ -256,9 +280,8 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next implementation task is step 3: replace the scene global and finish
-callback/lifecycle handling. Preparatory steps deliberately leave warning counts
-unchanged until the corresponding global can be replaced safely.
+The next implementation task is step 4: remove nested renderer/backend access
+before replacing `CONTEXT`. Four context warnings remain during that preparation.
 
 ## Rust reference guidance
 

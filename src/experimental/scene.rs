@@ -11,6 +11,10 @@ use std::{
 };
 
 #[rustfmt::skip]
+/// Scene callbacks run in ready, update, fixed-update, then camera draw order.
+/// Nodes added during dispatch become eligible next frame. A node whose ready
+/// callback is blocked by a live guard receives no later callbacks that frame.
+/// Ready is attempted once; a panic aborts the frame without retrying ready.
 pub trait Node {
     fn ready(_node: RefMut<Self>) where Self: Sized {}
     fn update(_node: RefMut<Self>) where Self: Sized {}
@@ -85,7 +89,7 @@ where
     F: for<'a> FnMut(&'a mut T) -> &'a mut U,
 {
     pub fn with<R>(&mut self, use_field: impl FnOnce(&mut U) -> R) -> Option<R> {
-        let mut node = unsafe { get_scene() }.get(self.handle)?;
+        let mut node = try_with_scene(|scene| scene.get(self.handle)).flatten()?;
         Some(use_field((self.project)(&mut node)))
     }
 }
@@ -153,7 +157,7 @@ impl RefMutAny<'_> {
         // Restore the value before removing membership. No user destructor runs
         // here while the registry still owns this entry.
         drop(self);
-        let removed = unsafe { get_scene() }.delete(id);
+        let removed = try_with_scene(|scene| scene.delete(id));
         // Destructors can look up, add, or delete other nodes.
         drop(removed);
     }
@@ -269,11 +273,10 @@ struct Scene {
     acc: f64,
     current_time: f64,
     in_fixed_update: bool,
+    updating: bool,
+    shutting_down: bool,
 }
 impl Scene {
-    fn new() -> Self {
-        Self::new_at(crate::time::get_time())
-    }
     fn new_at(now: f64) -> Self {
         let id = next_scene_id();
         Self {
@@ -287,6 +290,8 @@ impl Scene {
             acc: 0.0,
             current_time: now,
             in_fixed_update: false,
+            updating: false,
+            shutting_down: false,
         }
     }
     fn assert_owner(&self) {
@@ -298,13 +303,13 @@ impl Scene {
     }
     fn check_clear(&self) {
         self.assert_owner();
-        assert!(
-            self.nodes
-                .iter()
-                .flatten()
-                .all(|entry| entry.permanent.get() || !entry.is_borrowed()),
-            "cannot clear a borrowed node"
-        );
+        assert!(self.can_clear(), "cannot clear a borrowed node");
+    }
+    fn can_clear(&self) -> bool {
+        self.nodes
+            .iter()
+            .flatten()
+            .all(|entry| entry.permanent.get() || !entry.is_borrowed())
     }
     // Return detached entries: callers drop them AFTER releasing the registry.
     fn clear(&mut self) -> Vec<Rc<NodeEntry>> {
@@ -412,30 +417,114 @@ impl Iterator for MagicVecIterator {
     }
 }
 
-static mut SCENE: Option<Scene> = None;
+thread_local! {
+    static SCENE: RefCell<Option<Scene>> = const { RefCell::new(None) };
+}
 
-// Step 3 replaces this legacy global with scoped thread-local storage.
-// Owned guards never contain references into this registry.
-unsafe fn get_scene() -> &'static mut Scene {
-    SCENE.get_or_insert_with(Scene::new)
+// R cannot borrow the registry: only owned values and guards escape a call.
+// Optional access also tolerates TLS destruction; it never creates a session.
+fn try_with_scene<R>(f: impl FnOnce(&mut Scene) -> R) -> Option<R> {
+    SCENE
+        .try_with(|slot| slot.borrow_mut().as_mut().map(f))
+        .ok()
+        .flatten()
+}
+
+fn with_scene<R>(f: impl FnOnce(&mut Scene) -> R) -> R {
+    // Check before borrowing so rejected operations drop their captured values
+    // outside the registry borrow (their destructors may query the scene).
+    assert!(
+        SCENE
+            .try_with(|slot| slot.borrow().is_some())
+            .unwrap_or(false),
+        "scene is not initialized on this thread"
+    );
+    SCENE.with_borrow_mut(|slot| f(slot.as_mut().unwrap()))
+}
+
+/// Called after installing the graphics context, before polling user code.
+pub(crate) fn initialize(now: f64) {
+    assert!(
+        !SCENE.with_borrow(Option::is_some),
+        "scene already initialized"
+    );
+    let scene = Scene::new_at(now);
+    SCENE.with_borrow_mut(|slot| *slot = Some(scene));
+}
+
+/// Cancel coroutines while nodes still exist, then detach the whole registry.
+/// Normal completion and accepted quit call this before backend teardown.
+/// Node/camera destruction runs outside registry access.
+/// Outstanding guards keep detached values alive, but cannot address a new session.
+pub(crate) fn shutdown() {
+    shutdown_with(crate::experimental::coroutines::stop_all_coroutines);
+}
+
+fn shutdown_with(cancel: impl FnOnce()) {
+    let Some(id) = try_with_scene(|scene| {
+        if scene.shutting_down {
+            return None;
+        }
+        scene.shutting_down = true;
+        Some(scene.id)
+    })
+    .flatten() else {
+        return;
+    };
+
+    struct Detach(u64);
+    impl Drop for Detach {
+        fn drop(&mut self) {
+            let removed = SCENE.with_borrow_mut(|slot| {
+                if slot.as_ref().is_some_and(|scene| scene.id == self.0) {
+                    slot.take()
+                } else {
+                    None
+                }
+            });
+            drop(removed);
+        }
+    }
+    // Also detach if cancellation panics; nested shutdown calls are no-ops.
+    let _detach = Detach(id);
+    cancel();
 }
 
 pub(crate) fn allocated_memory() -> usize {
-    unsafe { get_scene() }
-        .nodes
-        .iter()
-        .flatten()
-        .map(|node| node.data_len)
-        .sum()
+    try_with_scene(|scene| scene.nodes.iter().flatten().map(|node| node.data_len).sum())
+        .unwrap_or(0)
 }
+
+/// Clear nonpersistent nodes and cancel coroutines. A borrowed nonpersistent
+/// node rejects clearing before cancellation. Cancellation/destruction can reenter
+/// the scene; registry validation is repeated after cancellation.
 pub fn clear() {
-    unsafe { get_scene() }.check_clear();
-    crate::experimental::coroutines::stop_all_coroutines();
-    clear_nodes();
+    clear_with(crate::experimental::coroutines::stop_all_coroutines);
 }
-fn clear_nodes() {
-    let removed = unsafe { get_scene() }.clear();
+
+fn clear_with(cancel: impl FnOnce()) {
+    let Some((id, can_clear)) = try_with_scene(|scene| (scene.id, scene.can_clear())) else {
+        return;
+    };
+    // Reject outside the borrow: an application's panic hook may query the scene.
+    assert!(can_clear, "cannot clear a borrowed node");
+    cancel();
+    if with_session(id, |scene| scene.can_clear()) == Some(false) {
+        panic!("cannot clear a borrowed node");
+    }
+    let removed = try_with_scene(|scene| {
+        if scene.id == id {
+            scene.clear()
+        } else {
+            Vec::new()
+        }
+    });
     drop(removed);
+}
+
+#[cfg(test)]
+fn clear_nodes() {
+    clear_with(|| {});
 }
 
 /// Get a node; panic if its handle is foreign, stale, wrongly typed, or borrowed.
@@ -443,87 +532,130 @@ pub fn get_node<T: Node>(handle: Handle<T>) -> RefMut<T> {
     try_get_node(handle).unwrap_or_else(|| panic!("No such node: {:?}", handle.id))
 }
 pub fn try_get_node<T: Node>(handle: Handle<T>) -> Option<RefMut<T>> {
-    unsafe { get_scene() }.get(handle)
+    try_with_scene(|scene| scene.get(handle)).flatten()
 }
 pub fn get_untyped_node(handle: HandleUntyped) -> Option<RefMutAny<'static>> {
-    unsafe { get_scene() }.get_any(handle)
+    try_with_scene(|scene| scene.get_any(handle)).flatten()
 }
 pub fn camera_pos() -> crate::Vec2 {
-    unsafe { get_scene() }.camera_pos
+    try_with_scene(|scene| scene.camera_pos).unwrap_or_default()
 }
 pub fn set_camera(n: usize, camera: Option<Camera2D>) {
-    assert!(n <= 4);
-    let previous = std::mem::replace(&mut unsafe { get_scene() }.camera[n], camera.map(Rc::new));
+    assert!(n < 4);
+    let previous = with_scene(|scene| std::mem::replace(&mut scene.camera[n], camera.map(Rc::new)));
     drop(previous);
 }
 pub fn add_node<T: Node>(node: T) -> Handle<T> {
-    unsafe { get_scene() }.add_node(node)
+    with_scene(|scene| scene.add_node(node))
 }
 pub(crate) fn update() {
     update_with(
         crate::time::get_time,
-        |camera| {
-            crate::prelude::push_camera_state();
-            crate::prelude::set_camera(camera);
-        },
+        crate::prelude::push_camera_state,
+        |camera| crate::prelude::set_camera(camera),
         crate::prelude::pop_camera_state,
     );
 }
 
-// Dispatch without a registry borrow, including destructors triggered by a
-// callback. Keep separate per-pass snapshots and legacy addition eligibility.
+fn with_session<R>(id: u64, f: impl FnOnce(&mut Scene) -> R) -> Option<R> {
+    try_with_scene(|scene| (scene.id == id).then(|| f(scene))).flatten()
+}
+
+struct DispatchScope(u64);
+impl Drop for DispatchScope {
+    fn drop(&mut self) {
+        with_session(self.0, |scene| {
+            scene.updating = false;
+            scene.in_fixed_update = false;
+        });
+    }
+}
+
+struct FixedScope(u64);
+impl Drop for FixedScope {
+    fn drop(&mut self) {
+        with_session(self.0, |scene| scene.in_fixed_update = false);
+    }
+}
+
+struct CameraScope<F: FnMut()>(F);
+impl<F: FnMut()> Drop for CameraScope<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+// One frame snapshot: additions wait until next frame; nodes whose ready pass
+// was blocked by a guard cannot receive later callbacks before initialization.
 fn update_with(
     clock: impl FnOnce() -> f64,
-    mut push_camera: impl FnMut(&Camera2D),
+    mut push_camera: impl FnMut(),
+    mut set_camera: impl FnMut(&Camera2D),
     mut pop_camera: impl FnMut(),
 ) {
-    for node in all_nodes() {
-        if !node.entry.initialized.replace(true) {
-            let ready = node.entry.callbacks.ready;
-            ready(node);
+    let Some((session, ids)) = try_with_scene(|scene| {
+        assert!(!scene.updating, "recursive scene update");
+        scene.updating = true;
+        (scene.id, scene.dense.clone())
+    }) else {
+        return;
+    };
+    let _dispatch = DispatchScope(session);
+    for id in &ids {
+        if let Some(node) = get_untyped_node(HandleUntyped(*id)) {
+            if !node.entry.initialized.replace(true) {
+                let ready = node.entry.callbacks.ready;
+                ready(node);
+            }
         }
     }
+    // Clock/context access is deliberately outside registry access.
     let now = clock();
-    unsafe { get_scene() }.advance_time(now);
-    for node in all_nodes() {
+    if with_session(session, |scene| scene.advance_time(now)).is_none() {
+        return;
+    }
+    let eligible =
+        |id: &Id| get_untyped_node(HandleUntyped(*id)).filter(|node| node.entry.initialized.get());
+    for node in ids.iter().filter_map(eligible) {
         let update = node.entry.callbacks.update;
         update(node);
     }
-    loop {
-        let run_fixed = {
-            let scene = unsafe { get_scene() };
-            if scene.acc > CONST_FPS {
-                scene.acc -= CONST_FPS;
-                true
-            } else {
-                false
-            }
-        };
-        if !run_fixed {
-            break;
+    while with_session(session, |scene| {
+        if scene.acc > CONST_FPS {
+            scene.acc -= CONST_FPS;
+            true
+        } else {
+            false
         }
-        for node in all_nodes() {
+    })
+    .unwrap_or(false)
+    {
+        for node in ids.iter().filter_map(eligible) {
             let fixed_update = node.entry.callbacks.fixed_update;
-            unsafe { get_scene() }.in_fixed_update = true;
+            with_session(session, |scene| scene.in_fixed_update = true);
+            let _fixed = FixedScope(session);
             fixed_update(node);
-            unsafe { get_scene() }.in_fixed_update = false;
         }
     }
     for n in 0..4 {
-        let camera = unsafe { get_scene() }.camera[n].clone();
+        let camera = with_session(session, |scene| scene.camera[n].clone()).flatten();
         if let Some(camera) = camera {
-            unsafe { get_scene() }.camera_pos = camera.target;
-            push_camera(&camera);
-            for node in all_nodes() {
+            with_session(session, |scene| scene.camera_pos = camera.target);
+            push_camera();
+            // Install after push but before set, so setup and draw panics both pop.
+            let _camera = CameraScope(&mut pop_camera);
+            set_camera(&camera);
+            for node in ids.iter().filter_map(eligible) {
                 let draw = node.entry.callbacks.draw;
                 draw(node);
             }
-            pop_camera();
         }
     }
 }
 pub fn all_nodes() -> MagicVecIterator {
-    unsafe { get_scene() }.iter()
+    try_with_scene(|scene| scene.iter()).unwrap_or_else(|| MagicVecIterator {
+        ids: Vec::new().into_iter(),
+    })
 }
 pub fn find_node_by_type<T: Any>() -> Option<RefMut<T>> {
     find_nodes_by_type().next()
@@ -549,7 +681,7 @@ pub fn find_nodes_by_type<T: Any>() -> impl Iterator<Item = RefMut<T>> {
 }
 const CONST_FPS: f64 = 1.0 / 60.;
 pub(crate) fn in_fixed_update() -> bool {
-    unsafe { get_scene() }.in_fixed_update
+    try_with_scene(|scene| scene.in_fixed_update).unwrap_or(false)
 }
 pub(crate) const fn fixed_frame_time() -> f32 {
     CONST_FPS as _

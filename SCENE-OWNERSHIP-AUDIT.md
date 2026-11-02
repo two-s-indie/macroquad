@@ -1,10 +1,85 @@
 # Scene ownership audit
 
-Steps 1 and 2 of [SCENE-CONTEXT-PLAN.md](SCENE-CONTEXT-PLAN.md), on
+Steps 1 through 3 of [SCENE-CONTEXT-PLAN.md](SCENE-CONTEXT-PLAN.md), on
 `feature/scene-context-safety`. The current outcome is recorded first; the
-historical step 1 baseline follows. The scene global still needs replacement.
+historical outcomes and step 1 baseline follow. Context migration remains open.
 
-## Step 2 outcome
+## Step 3 outcome
+
+The scene registry is now `thread_local!` `RefCell<Option<Scene>>`. Private access
+closures return owned values/guards, never registry references. Read-style APIs
+return absence/defaults when inactive or during TLS destruction; mutations require
+an initialized session on the calling thread. No lookup initializes a scene or
+reads the graphics clock. Window setup explicitly installs a fresh scene after
+the graphics context is ready. Session IDs still reject handles from another
+thread or earlier session. The scene module contains no unsafe code.
+
+Dispatch snapshots IDs once per frame. The deliberate compatibility correction
+is that additions in any callback phase first run next frame, with ready before
+other callbacks. A live guard blocking ready also blocks later callbacks for that
+node during that frame. Ready is marked attempted before invocation, so a panicking
+ready callback is not retried. Callback order, camera slot order, refresh snapping,
+and the strict fixed-step boundary are retained. Deletions still take effect
+immediately; reused slots cannot enter an existing frame snapshot.
+
+Dispatch and fixed-step flags are restored by guards on unwind. Camera state is
+popped if camera setup or drawing panics after a successful push. Recursive
+dispatch is rejected without releasing the outer dispatch state. The engine now
+calls scene update outside `Context::end_frame` and inside its user-code panic
+recovery boundary, so scene callbacks can use camera/timing/drawing APIs without
+retaining a whole-context borrow from the scene call site.
+
+Clear validates before cancellation, calls cancellation outside registry access,
+and revalidates afterward. Failed registry validation leaves membership unchanged;
+side effects already performed by cancellation/destructors are not rolled back.
+Explicit coroutine stopping detaches its snapshot before dropping futures, so
+destructors may access the scene or create/stop coroutines. Newly created
+coroutines survive that cancellation call. Coroutine polling still uses the old
+context/scheduler access model; its reentrancy migration remains step 6.
+
+### Session shutdown
+
+On normal completion or accepted quit, the main future is released, coroutines
+are canceled while the scene is still available, then the complete registry is
+detached and nodes/cameras are dropped outside registry access. This includes
+persistent nodes. The backend remains available on these normal exit paths.
+Nested shutdown is a no-op, and cancellation panic still detaches the scene.
+Outstanding node guards retain their data; their handles cannot address a later
+session. During node teardown, optional scene lookup sees an inactive registry;
+creating a new node requires a new engine session.
+
+Stage destruction provides a fallback for unwinding or backend exits that bypass
+the normal quit path. Its backend availability is platform-dependent; direct
+low-level forced quit and graphics resources retained beyond shutdown are not
+covered by the normal-exit guarantee. Full resource disposal and context shutdown
+remain steps 5 and 8. Ordinary node data also drops at TLS destruction; optional
+lookup tolerates the destroyed TLS key, while mutation is rejected.
+
+### Step 3 verification
+
+- `cargo test --lib`: 61 passed, none ignored, including 37 scene tests covering
+  actual TLS isolation, repeated sessions, cancellation reentry/panics, shutdown,
+  callback/setup unwinding, recursive dispatch, and readiness ordering.
+- `cargo test --test scene_lifecycle -- --test-threads=1`: passed. Both child
+  processes passed, verifying target pixels drawn by callbacks, time/camera access,
+  cancellation reentry, completion and accepted-quit teardown, and GPU access
+  from node destructors before backend teardown.
+- Miniquad's process-global native display rejects a second window initialization
+  with `NATIVE_DISPLAY already set`. This prevented running the existing three
+  coroutine tests together in one process. Each scenario must run separately;
+  the new integration test handles this process isolation itself. Repeated scene
+  sessions are verified headlessly, not by reopening native windows.
+- All three `coroutine_pause` tests passed when run in separate processes
+  (`coroutine_execution_order`, `coroutine_manual_poll`, and
+  `coroutine_manual_poll_delay`, selected with `--exact`).
+- `cargo build`, `cargo check --all-targets`, and
+  `cargo check --lib --target wasm32-unknown-unknown` passed. Examples were compiled,
+  not run. Formatting and whitespace checks passed. The existing tiled lifetime
+  warning remains in all-target checks.
+- Miri remains unavailable. The four `CONTEXT` warnings remain; none originate
+  from scene storage. This does not claim the remaining context code is alias-safe.
+
+## Step 2 outcome (historical)
 
 - Each node uses a correctly aligned `Box<T>` erased through `Any`, plus a stable
   `Rc<NodeEntry>`. A guard takes sole ownership of the boxed value and capabilities

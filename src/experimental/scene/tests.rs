@@ -1,10 +1,7 @@
-//! Ownership regressions and callback characterization. The remaining global
-//! and engine lifecycle still require the step 3 migration.
+//! Ownership, callback, and thread-local scene lifecycle regressions.
 
 use super::*;
-use std::{cell::RefCell, panic::AssertUnwindSafe, sync::Mutex};
-
-static SCENE_TEST_LOCK: Mutex<()> = Mutex::new(());
+use std::{cell::RefCell, panic::AssertUnwindSafe};
 
 thread_local! {
     static EVENTS: RefCell<Vec<(u8, &'static str)>> = const { RefCell::new(Vec::new()) };
@@ -22,22 +19,21 @@ fn events() -> Vec<(u8, &'static str)> {
 // All tests touching SCENE use this fixture. Detach the old registry before
 // dropping it, so test destructors may safely reenter the restored scene.
 fn with_scene(test: impl FnOnce()) {
-    let _lock = SCENE_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     struct Restore(Option<Scene>);
     impl Drop for Restore {
         fn drop(&mut self) {
-            let scene = unsafe { std::ptr::replace(&raw mut SCENE, self.0.take()) };
+            let scene = SCENE.replace(self.0.take());
             drop(scene);
         }
     }
-    let _restore = Restore(unsafe { std::ptr::replace(&raw mut SCENE, Some(Scene::new_at(0.0))) });
+    let _restore = Restore(SCENE.replace(Some(Scene::new_at(0.0))));
     events();
     DELETE_TARGET.with(|target| *target.borrow_mut() = None);
     test();
 }
 
 fn tick(now: f64) {
-    update_with(|| now, |_| {}, || {});
+    update_with(|| now, || {}, |_| {}, || {});
 }
 
 struct Value(u8);
@@ -98,7 +94,7 @@ fn clear_preserves_persistent_nodes_and_resets_reused_capabilities() {
         get_node(temporary).provides(42u8);
         // A borrowed persistent node is unaffected by clear.
         let held = get_node(persistent);
-        unsafe { get_scene() }.clear();
+        clear_nodes();
         assert_eq!(held.0, 1);
         drop(held);
         assert!(try_get_node(temporary).is_none());
@@ -106,7 +102,7 @@ fn clear_preserves_persistent_nodes_and_resets_reused_capabilities() {
         let reused = add_node(Value(3));
         assert_eq!(reused.id.unwrap().id, temporary.id.unwrap().id);
         assert_eq!(find_nodes_with::<u8>().count(), 0);
-        unsafe { get_scene() }.clear();
+        clear_nodes();
         assert_eq!(events(), [(3, "drop")]);
         assert_eq!(get_node(persistent).0, 1);
     });
@@ -181,7 +177,8 @@ fn callback_order_clock_sampling_and_camera_passes() {
                 record(0, "clock");
                 CONST_FPS
             },
-            |_| record(0, "push"),
+            || record(0, "push"),
+            |_| {},
             || record(0, "pop"),
         );
         assert_eq!(
@@ -225,14 +222,14 @@ fn nearby_frame_durations_snap_to_common_refresh_intervals() {
     for interval in [1.0 / 120.0, 1.0 / 60.0, 1.0 / 30.0] {
         with_scene(|| {
             tick(interval + 0.0001);
-            let scene = unsafe { get_scene() };
+            let (acc, current_time) = super::with_scene(|scene| (scene.acc, scene.current_time));
             let expected = if interval > CONST_FPS {
                 CONST_FPS
             } else {
                 interval
             };
-            assert!((scene.acc - expected).abs() < 1e-12);
-            assert_eq!(scene.current_time, interval + 0.0001);
+            assert!((acc - expected).abs() < 1e-12);
+            assert_eq!(current_time, interval + 0.0001);
         });
     }
 }
@@ -248,11 +245,11 @@ impl Node for Spawner {
 }
 
 #[test]
-fn legacy_addition_during_update_can_draw_before_ready() {
+fn addition_during_update_waits_until_ready_next_frame() {
     with_scene(|| {
         add_node(Spawner(false));
         tick(0.0);
-        assert_eq!(events(), [(2, "draw")]);
+        assert!(events().is_empty());
         tick(0.0);
         assert_eq!(events(), [(2, "ready"), (2, "update"), (2, "draw")]);
     });
@@ -287,9 +284,7 @@ fn rejected_clear_leaves_all_nodes_registered() {
         let a = add_node(Value(1));
         let b = add_node(Value(2));
         let held = get_node(b);
-        assert!(
-            std::panic::catch_unwind(AssertUnwindSafe(|| unsafe { get_scene() }.clear())).is_err()
-        );
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| clear_nodes())).is_err());
         assert_eq!(held.0, 2);
         assert!(events().is_empty());
         drop(held);
@@ -305,7 +300,7 @@ fn stale_delete_does_not_remove_reused_slot() {
         get_node(old).delete();
         tick(0.0);
         let new = add_node(Value(2));
-        assert!(unsafe { get_scene() }.delete(old.id.unwrap()).is_none());
+        assert!(super::with_scene(|scene| scene.delete(old.id.unwrap())).is_none());
         assert!(try_get_node(new).is_some());
     });
 }
@@ -429,7 +424,7 @@ fn rejected_delete_preserves_a_borrowed_node() {
         let handle = add_node(Value(1));
         let held = get_node(handle);
         assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
-            unsafe { get_scene() }.delete(handle.id.unwrap());
+            super::with_scene(|scene| scene.delete(handle.id.unwrap()));
         }))
         .is_err());
         assert_eq!(held.0, 1);
@@ -692,7 +687,7 @@ fn sendable_handles_do_not_resolve_in_another_threads_scene() {
     let mut scene = Scene::new_at(0.0);
     let handle = scene.add_node(fields());
     std::thread::spawn(move || {
-        // Use an independent registry; global concurrent access awaits step 3.
+        // Independently constructed registries also reject foreign identities.
         let mut other = Scene::new_at(0.0);
         let local = other.add_node(fields());
         assert_eq!(local.id.unwrap().id, handle.id.unwrap().id);
@@ -701,4 +696,285 @@ fn sendable_handles_do_not_resolve_in_another_threads_scene() {
     .join()
     .unwrap();
     assert!(scene.get(handle).is_some());
+}
+
+#[test]
+fn thread_local_registries_reject_foreign_handles_through_public_lookup() {
+    with_scene(|| {
+        let local = add_node(fields());
+        let foreign = std::thread::spawn(move || {
+            assert!(try_get_node(local).is_none()); // No implicit initialization.
+            initialize(0.0);
+            let foreign = add_node(fields());
+            assert_eq!(local.id.unwrap().id, foreign.id.unwrap().id);
+            assert!(try_get_node(local).is_none());
+            assert!(try_get_node(foreign).is_some());
+            shutdown_with(|| {});
+            foreign
+        })
+        .join()
+        .unwrap();
+        assert!(try_get_node(foreign).is_none());
+        assert!(try_get_node(local).is_some());
+    });
+}
+
+#[test]
+fn shutdown_reinitialization_and_late_guards_keep_sessions_separate() {
+    with_scene(|| {
+        let old = add_node(Value(1));
+        let mut held = get_node(old);
+        shutdown_with(|| {
+            assert!(try_get_node(old).is_none()); // Still borrowed.
+            add_node(Other(2));
+            shutdown_with(|| panic!("nested shutdown must be a no-op"));
+        });
+        assert!(try_with_scene(|_| ()).is_none());
+        assert!(events().is_empty());
+        initialize(10.0);
+        let fresh = add_node(Value(3));
+        assert_eq!(old.id.unwrap().id, fresh.id.unwrap().id);
+        assert!(try_get_node(old).is_none());
+        held.0 = 4;
+        held.delete();
+        assert_eq!(get_node(fresh).0, 3);
+        assert_eq!(events(), [(4, "drop")]);
+        shutdown_with(|| assert!(try_get_node(fresh).is_some()));
+        assert_eq!(events(), [(3, "drop")]);
+        assert_eq!(all_nodes().count(), 0);
+        assert!(!in_fixed_update());
+        assert_eq!(allocated_memory(), 0);
+        tick(0.0); // Inactive dispatch must not sample a graphics clock.
+    });
+}
+
+#[test]
+fn clear_preflights_before_cancellation_and_rechecks_reentrant_changes() {
+    with_scene(|| {
+        let handle = add_node(Value(1));
+        let held = get_node(handle);
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_with(|| panic!("must not cancel before preflight"));
+        }))
+        .is_err());
+        // Check explicitly as a panic from the callback would also be caught.
+        let cancelled = Cell::new(false);
+        let _ = std::panic::catch_unwind(AssertUnwindSafe(|| clear_with(|| cancelled.set(true))));
+        assert!(!cancelled.get());
+        drop(held);
+        let mut retained = None;
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| clear_with(|| {
+            retained = Some(get_node(handle));
+            add_node(Other(2));
+        })))
+        .is_err());
+        assert!(events().is_empty());
+        drop(retained);
+        assert_eq!(all_nodes().count(), 2); // Cancellation side effects are retained.
+        clear_with(|| {
+            assert_eq!(get_node(handle).0, 1);
+            clear_nodes(); // Nested clear has no registry borrow conflict.
+            add_node(Value(3));
+        });
+        assert_eq!(all_nodes().count(), 0);
+        assert_eq!(events(), [(1, "drop"), (3, "drop")]);
+    });
+}
+
+#[test]
+fn cancellation_panic_detaches_shutdown_but_does_not_partially_clear() {
+    with_scene(|| {
+        let handle = add_node(Value(1));
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            clear_with(|| panic!("cancel"));
+        }))
+        .is_err());
+        assert!(try_get_node(handle).is_some());
+        assert!(events().is_empty());
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| {
+            shutdown_with(|| panic!("cancel on shutdown"));
+        }))
+        .is_err());
+        assert!(try_with_scene(|_| ()).is_none());
+        assert_eq!(events(), [(1, "drop")]);
+    });
+}
+
+struct ExitProbe(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+impl Node for ExitProbe {}
+impl Drop for ExitProbe {
+    fn drop(&mut self) {
+        assert_eq!(all_nodes().count(), 0);
+        assert!(try_get_node(Handle::<Other>::null()).is_none());
+        self.0.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+#[test]
+fn optional_access_during_tls_teardown_does_not_resurrect_the_scene() {
+    let dropped = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let count = dropped.clone();
+    std::thread::spawn(move || {
+        initialize(0.0);
+        add_node(ExitProbe(count));
+        // Deliberately exercise TLS fallback without explicit engine shutdown.
+    })
+    .join()
+    .unwrap();
+    assert_eq!(dropped.load(Ordering::Relaxed), 1);
+}
+
+struct PanicPhase(u8, bool);
+impl PanicPhase {
+    fn visit(mut node: RefMut<Self>, phase: u8) {
+        if node.0 == phase && !node.1 {
+            node.1 = true;
+            panic!("callback phase {phase}");
+        }
+    }
+}
+impl Node for PanicPhase {
+    fn ready(node: RefMut<Self>) {
+        Self::visit(node, 0);
+    }
+    fn update(node: RefMut<Self>) {
+        Self::visit(node, 1);
+    }
+    fn fixed_update(node: RefMut<Self>) {
+        Self::visit(node, 2);
+    }
+    fn draw(node: RefMut<Self>) {
+        Self::visit(node, 3);
+    }
+}
+
+#[test]
+fn callback_panics_release_guards_and_restore_dispatch_fixed_and_camera_state() {
+    for phase in 0..4 {
+        with_scene(|| {
+            let handle = add_node(PanicPhase(phase, false));
+            let depth = Cell::new(0);
+            let pops = Cell::new(0);
+            assert!(std::panic::catch_unwind(AssertUnwindSafe(|| update_with(
+                || 0.02,
+                || depth.set(depth.get() + 1),
+                |_| {},
+                || {
+                    depth.set(depth.get() - 1);
+                    pops.set(pops.get() + 1);
+                },
+            )))
+            .is_err());
+            assert_eq!(depth.get(), 0);
+            assert_eq!(pops.get(), usize::from(phase == 3));
+            assert!(!in_fixed_update());
+            assert!(!super::with_scene(|scene| scene.updating));
+            assert!(get_node(handle).1);
+            tick(0.04);
+        });
+    }
+}
+
+#[test]
+fn camera_setup_panics_pop_state_and_hooks_can_reenter_scene() {
+    with_scene(|| {
+        let handle = add_node(Value(1));
+        let depth = Cell::new(0);
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| update_with(
+            || {
+                assert!(try_get_node(handle).is_some());
+                0.0
+            },
+            || {
+                assert!(try_get_node(handle).is_some());
+                depth.set(1);
+            },
+            |_| {
+                set_camera(0, None);
+                panic!("camera setup");
+            },
+            || {
+                assert!(try_get_node(handle).is_some());
+                depth.set(0);
+            },
+        )))
+        .is_err());
+        assert_eq!(depth.get(), 0);
+        assert!(!super::with_scene(|scene| scene.updating));
+        tick(0.0);
+    });
+}
+
+struct SpawnPhase(u8, bool);
+impl SpawnPhase {
+    fn visit(mut node: RefMut<Self>, phase: u8) {
+        if node.0 == phase && !node.1 {
+            node.1 = true;
+            add_node(Trace(2));
+        }
+    }
+}
+impl Node for SpawnPhase {
+    fn ready(node: RefMut<Self>) {
+        Self::visit(node, 0);
+    }
+    fn update(node: RefMut<Self>) {
+        Self::visit(node, 1);
+    }
+    fn fixed_update(node: RefMut<Self>) {
+        Self::visit(node, 2);
+    }
+    fn draw(node: RefMut<Self>) {
+        Self::visit(node, 3);
+    }
+}
+
+#[test]
+fn additions_in_every_callback_phase_wait_for_next_frames_ready() {
+    for phase in 0..4 {
+        with_scene(|| {
+            add_node(SpawnPhase(phase, false));
+            tick(0.02);
+            assert!(events().is_empty());
+            tick(0.02);
+            assert_eq!(events(), [(2, "ready"), (2, "update"), (2, "draw")]);
+        });
+    }
+}
+
+#[test]
+fn guard_blocking_ready_also_blocks_later_phases_in_that_frame() {
+    with_scene(|| {
+        let handle = add_node(Trace(1));
+        let held = get_node(handle);
+        update_with(
+            || {
+                drop(held);
+                0.02
+            },
+            || {},
+            |_| {},
+            || {},
+        );
+        assert!(events().is_empty());
+        tick(0.02);
+        assert_eq!(events(), [(1, "ready"), (1, "update"), (1, "draw")]);
+    });
+}
+
+struct RecursiveUpdate;
+impl Node for RecursiveUpdate {
+    fn update(_node: RefMut<Self>) {
+        assert!(std::panic::catch_unwind(AssertUnwindSafe(|| tick(0.0))).is_err());
+        assert!(super::with_scene(|scene| scene.updating));
+    }
+}
+
+#[test]
+fn recursive_dispatch_is_rejected_without_unlocking_the_outer_dispatch() {
+    with_scene(|| {
+        add_node(RecursiveUpdate);
+        tick(0.0);
+        assert!(!super::with_scene(|scene| scene.updating));
+    });
 }
