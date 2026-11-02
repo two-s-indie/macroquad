@@ -12,6 +12,11 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Replace the profiler's mutable global with thread-local `RefCell` storage and
+  scoped borrows, removing its `static_mut_refs` warning while preserving the
+  public telemetry API. Avoid nested profiler access during frame reset and
+  apply capture-state changes after releasing the profiler borrow. Add tests
+  for nested zones, frame reset, capture transitions, and thread isolation.
 - Replace the experimental storage's mutable global with thread-local storage
   and owned borrow guards, removing its six `static_mut_refs` warnings without
   adding unsafe code. Preserve the `store`/`get`/`get_mut` API and runtime borrow

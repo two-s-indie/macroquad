@@ -1,24 +1,11 @@
+//! Frame profiling and rendering diagnostics local to the current thread.
+
 use crate::{get_context, get_quad_context, time::get_time};
 
-use std::collections::HashMap;
+use std::{cell::RefCell, collections::HashMap};
 
-static mut PROFILER: Option<Profiler> = None;
-
-fn get_profiler() -> &'static mut Profiler {
-    unsafe {
-        PROFILER.get_or_insert_with(|| Profiler {
-            frame: Frame::new(),
-            queries: HashMap::new(),
-            active_query: None,
-            prev_frame: Frame::new(),
-            enabled: false,
-            enable_request: None,
-            capture_request: false,
-            capture: false,
-            drawcalls: vec![],
-            strings: vec![],
-        })
-    }
+thread_local! {
+    static PROFILER: RefCell<Profiler> = RefCell::new(Profiler::new());
 }
 
 #[derive(Debug, Clone)]
@@ -65,79 +52,60 @@ impl Drop for ZoneGuard {
 }
 
 pub fn enable() {
-    get_profiler().enable_request = Some(true);
+    PROFILER.with_borrow_mut(|profiler| profiler.enable_request = Some(true));
 }
 
 pub fn disable() {
-    get_profiler().enable_request = Some(false);
+    PROFILER.with_borrow_mut(|profiler| profiler.enable_request = Some(false));
 }
 
 pub fn is_enabled() -> bool {
-    get_profiler().enabled
+    PROFILER.with_borrow(|profiler| profiler.enabled)
 }
 
 pub fn begin_zone(name: &str) {
-    if get_profiler().enabled {
-        get_profiler().begin_zone(name);
+    if is_enabled() {
+        let now = get_time();
+        PROFILER.with_borrow_mut(|profiler| profiler.begin_zone(name, now));
     }
 }
 
 pub fn end_zone() {
-    if get_profiler().enabled {
-        get_profiler().end_zone();
+    if is_enabled() {
+        let now = get_time();
+        PROFILER.with_borrow_mut(|profiler| profiler.end_zone(now));
     }
 }
 
 pub fn begin_gpu_query(name: &str) {
-    get_profiler().begin_gpu_query(name);
+    PROFILER.with_borrow_mut(|profiler| profiler.begin_gpu_query(name));
 }
 
 pub fn end_gpu_query() {
-    get_profiler().end_gpu_query();
+    PROFILER.with_borrow_mut(Profiler::end_gpu_query);
 }
 
 /// Workaround to stop gl capture on debug rendering
 #[doc(hidden)]
 pub fn pause_gl_capture() {
-    if get_profiler().capture {
+    if PROFILER.with_borrow(|profiler| profiler.capture) {
         crate::get_context().gl.capture(false);
     }
 }
 
 /// Workaround to stop gl capture on debug rendering
 pub fn resume_gl_capture() {
-    if get_profiler().capture {
+    if PROFILER.with_borrow(|profiler| profiler.capture) {
         crate::get_context().gl.capture(false);
     }
 }
 
 pub(crate) fn reset() {
-    let profiler = get_profiler();
-
-    assert!(
-        get_profiler().frame.active_zone.is_null(),
-        "New frame started with unpaired begin/end zones."
-    );
-
-    profiler.frame.full_frame_time = crate::time::get_frame_time();
-
-    std::mem::swap(&mut profiler.prev_frame, &mut profiler.frame);
-    profiler.frame = Frame::new();
-
-    if let Some(enable) = profiler.enable_request.take() {
-        profiler.enabled = enable;
-    }
-
-    if profiler.capture {
-        profiler.capture = false;
-        crate::get_context().gl.capture(false);
-    }
-
-    if profiler.capture_request {
-        profiler.drawcalls.clear();
-        profiler.capture = true;
-        crate::get_context().gl.capture(true);
-        profiler.capture_request = false;
+    let frame_time = crate::time::get_frame_time();
+    let capture = PROFILER.with_borrow_mut(|profiler| profiler.reset(frame_time));
+    // Apply rendering state only after releasing the profiler borrow.
+    if let Some(capture) = capture {
+        get_context().gl.capture(capture);
     }
 }
 
@@ -175,21 +143,25 @@ impl Frame {
 }
 
 pub fn frame() -> Frame {
-    get_profiler().prev_frame.clone()
+    PROFILER.with_borrow(|profiler| profiler.prev_frame.clone())
 }
 
 pub fn gpu_queries() -> Vec<(String, u64)> {
-    get_profiler()
-        .queries
-        .iter()
-        .map(|(name, query)| (name.to_owned(), query.value))
-        .collect()
+    PROFILER.with_borrow(|profiler| {
+        profiler
+            .queries
+            .iter()
+            .map(|(name, query)| (name.to_owned(), query.value))
+            .collect()
+    })
 }
 
 pub fn sample_gpu_queries() {
-    for query in &mut get_profiler().queries {
-        query.1.force_resume = true;
-    }
+    PROFILER.with_borrow_mut(|profiler| {
+        for query in profiler.queries.values_mut() {
+            query.force_resume = true;
+        }
+    });
 }
 
 struct Profiler {
@@ -206,6 +178,50 @@ struct Profiler {
 }
 
 impl Profiler {
+    fn new() -> Self {
+        Self {
+            frame: Frame::new(),
+            queries: HashMap::new(),
+            active_query: None,
+            prev_frame: Frame::new(),
+            enabled: false,
+            enable_request: None,
+            capture_request: false,
+            capture: false,
+            drawcalls: vec![],
+            strings: vec![],
+        }
+    }
+
+    // Return a requested rendering-state change without borrowing the renderer.
+    fn reset(&mut self, frame_time: f32) -> Option<bool> {
+        assert!(
+            self.frame.active_zone.is_null(),
+            "New frame started with unpaired begin/end zones."
+        );
+
+        self.frame.full_frame_time = frame_time;
+        std::mem::swap(&mut self.prev_frame, &mut self.frame);
+        self.frame = Frame::new();
+
+        if let Some(enable) = self.enable_request.take() {
+            self.enabled = enable;
+        }
+
+        let mut capture = None;
+        if self.capture {
+            self.capture = false;
+            capture = Some(false);
+        }
+        if self.capture_request {
+            self.drawcalls.clear();
+            self.capture = true;
+            capture = Some(true);
+            self.capture_request = false;
+        }
+        capture
+    }
+
     fn begin_gpu_query(&mut self, name: &str) {
         assert!(
             self.active_query.is_none(),
@@ -245,7 +261,7 @@ impl Profiler {
         }
     }
 
-    fn begin_zone(&mut self, name: &str) {
+    fn begin_zone(&mut self, name: &str, now: f64) {
         let zones = if self.frame.active_zone.is_null() {
             &mut self.frame.zones
         } else {
@@ -254,7 +270,7 @@ impl Profiler {
 
         zones.push(Zone {
             name: name.to_string(),
-            start_time: get_time(),
+            start_time: now,
             duration: 0.0,
             parent: self.frame.active_zone,
             children: vec![],
@@ -262,14 +278,14 @@ impl Profiler {
         self.frame.active_zone = zones.last_mut().unwrap() as _;
     }
 
-    fn end_zone(&mut self) {
+    fn end_zone(&mut self, now: f64) {
         assert!(
             self.frame.active_zone.is_null() == false,
             "end_zone called without begin_zone"
         );
 
         let start_time = unsafe { (&mut *self.frame.active_zone).start_time };
-        let duration = get_time() - start_time;
+        let duration = now - start_time;
 
         unsafe { (&mut *self.frame.active_zone).duration = duration };
         self.frame.active_zone = unsafe { (&mut *self.frame.active_zone).parent };
@@ -322,15 +338,15 @@ impl<'a> Drop for LogTimeGuard<'a> {
 }
 
 pub fn log_string(string: &str) {
-    get_profiler().strings.push(string.to_owned());
+    PROFILER.with_borrow_mut(|profiler| profiler.strings.push(string.to_owned()));
 }
 
 pub fn drawcalls() -> Vec<DrawCallTelemetry> {
-    get_profiler().drawcalls.clone()
+    PROFILER.with_borrow(|profiler| profiler.drawcalls.clone())
 }
 
 pub fn strings() -> Vec<String> {
-    get_profiler().strings.clone()
+    PROFILER.with_borrow(|profiler| profiler.strings.clone())
 }
 
 /// Note that coroutines pre-allocate 56Kb, so 56000 as a result doesnt mean a leak
@@ -343,7 +359,7 @@ pub fn active_coroutines_count() -> usize {
 }
 
 pub fn capture_frame() {
-    get_profiler().capture_request = true;
+    PROFILER.with_borrow_mut(|profiler| profiler.capture_request = true);
 }
 
 #[derive(Clone, Debug)]
@@ -370,12 +386,17 @@ pub(crate) fn track_drawcall(
     get_quad_context().draw(0, indices_count as _, 1);
     get_quad_context().end_render_pass();
 
-    get_profiler().drawcalls.push(DrawCallTelemetry {
-        indices_count,
-        texture,
+    PROFILER.with_borrow_mut(|profiler| {
+        profiler.drawcalls.push(DrawCallTelemetry {
+            indices_count,
+            texture,
+        });
     });
 }
 
 pub fn textures_count() -> usize {
     get_context().textures.len()
 }
+
+#[cfg(test)]
+mod tests;
