@@ -17,6 +17,9 @@ log-rs = ["log"]
 glam-serde = ["glam/serde"]
 default = []
 
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(one_screenshot)'] }
+
 [package.metadata.android]
 assets = "examples/"
 

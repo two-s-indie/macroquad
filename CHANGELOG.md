@@ -10,6 +10,13 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ## Unreleased
 
+### Fixed
+
+- Declare `one_screenshot` as an expected custom cfg under `[lints.rust]` to
+  eliminate its `unexpected_cfgs` warnings. Preserve the opt-in
+  `RUSTFLAGS='--cfg one_screenshot'` debug mode, which saves `screenshot.png`
+  on frame 3 and then panics; the lint declaration does not enable the mode.
+
 ### Changed
 
 - Update `image` from `0.24` to `0.25`, retaining disabled default features and
