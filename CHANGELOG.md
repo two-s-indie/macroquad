@@ -53,6 +53,8 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Documentation
 
+- Add `SCENE-CONTEXT-PLAN.md` with ordered ownership, callback, lifecycle, and
+  validation steps for fixing the remaining scene and context globals.
 - Add this changelog covering all 10 existing commits on `game` since its
   divergence from `master`, through `1420b0d`.
 - Require changelog updates alongside changes committed in this fork in
