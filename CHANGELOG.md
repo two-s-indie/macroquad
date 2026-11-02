@@ -10,6 +10,16 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ## Unreleased
 
+### Changed
+
+- Update `glam` from `0.27` to `0.34.2`, retaining `scalar-math` and the
+  optional `glam-serde` feature. Migrate camera view and projection constructors
+  to the new `glam::camera` API while preserving right-handed OpenGL conventions
+  and the existing experimental `camera` module export in the prelude.
+  The dependency now requires Rust 1.85 or newer. Downstream code using the
+  re-exported math types must use a compatible `glam` version and migrate any
+  removed constructors to the new camera API.
+
 ### Documentation
 
 - Add this changelog covering all 10 existing commits on `game` since its

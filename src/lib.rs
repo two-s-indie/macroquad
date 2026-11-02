@@ -463,7 +463,7 @@ impl Context {
 
         let dpi = miniquad::window::dpi_scale();
 
-        glam::Mat4::orthographic_rh_gl(0., width / dpi, height / dpi, 0., -1., 1.)
+        glam::camera::rh::proj::opengl::orthographic(0., width / dpi, height / dpi, 0., -1., 1.)
     }
 
     pub(crate) fn projection_matrix(&self) -> glam::Mat4 {

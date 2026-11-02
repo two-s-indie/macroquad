@@ -7,6 +7,7 @@ use crate::{
     texture::RenderTarget,
     window::{screen_height, screen_width},
 };
+use glam::camera::rh::{proj::opengl, view};
 use glam::{vec2, vec3, Mat4, Vec2, Vec3};
 
 pub trait Camera {
@@ -249,15 +250,15 @@ impl Camera for Camera3D {
 
         match self.projection {
             Projection::Perspective => {
-                Mat4::perspective_rh_gl(self.fovy, aspect, self.z_near, self.z_far)
-                    * Mat4::look_at_rh(self.position, self.target, self.up)
+                opengl::perspective(self.fovy, aspect, self.z_near, self.z_far)
+                    * view::look_at_mat4(self.position, self.target, self.up)
             }
             Projection::Orthographics => {
                 let top = self.fovy / 2.0;
                 let right = top * aspect;
 
-                Mat4::orthographic_rh_gl(-right, right, -top, top, self.z_near, self.z_far)
-                    * Mat4::look_at_rh(self.position, self.target, self.up)
+                opengl::orthographic(-right, right, -top, top, self.z_near, self.z_far)
+                    * view::look_at_mat4(self.position, self.target, self.up)
             }
         }
     }

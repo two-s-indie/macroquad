@@ -20,6 +20,8 @@ pub use miniquad::{
 };
 pub use quad_rand as rand;
 
+// Keep the existing camera module unambiguous alongside glam's camera module.
+pub use crate::experimental::camera;
 pub use crate::experimental::*;
 
 pub use crate::logging::*;
