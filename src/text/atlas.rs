@@ -1,5 +1,4 @@
 use crate::{
-    get_quad_context,
     math::Rect,
     resource_disposal::DisposalSender,
     texture::{Image, TextureDisposal},
@@ -80,7 +79,9 @@ impl Atlas {
     }
 
     pub fn set_filter(&mut self, filter_mode: miniquad::FilterMode) {
-        self.set_filter_with(get_quad_context(), filter_mode);
+        crate::with_context(|context| {
+            self.set_filter_with(&mut *context.quad_context, filter_mode)
+        });
     }
 
     pub(crate) fn set_filter_with(
@@ -88,6 +89,7 @@ impl Atlas {
         ctx: &mut dyn miniquad::RenderingBackend,
         filter_mode: miniquad::FilterMode,
     ) {
+        self.disposal.assert_active();
         self.filter = filter_mode;
         ctx.texture_set_filter(self.texture, filter_mode, miniquad::MipmapFilterMode::None);
     }
@@ -108,6 +110,7 @@ impl Atlas {
         &mut self,
         ctx: &mut dyn miniquad::RenderingBackend,
     ) -> miniquad::TextureId {
+        self.disposal.assert_active();
         if self.dirty {
             self.dirty = false;
             let (texture_width, texture_height) = ctx.texture_size(self.texture);
@@ -131,7 +134,7 @@ impl Atlas {
     }
 
     pub fn get_uv_rect(&self, key: SpriteKey) -> Option<Rect> {
-        self.get_uv_rect_with(get_quad_context(), key)
+        crate::with_context(|context| self.get_uv_rect_with(&mut *context.quad_context, key))
     }
 
     pub(crate) fn get_uv_rect_with(
@@ -140,6 +143,7 @@ impl Atlas {
         key: SpriteKey,
     ) -> Option<Rect> {
         self.get(key).map(|sprite| {
+            self.disposal.assert_active();
             let (w, h) = ctx.texture_size(self.texture);
 
             Rect::new(

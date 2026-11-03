@@ -1,6 +1,6 @@
 //! Frame profiling and rendering diagnostics local to the current thread.
 
-use crate::{get_context, time::get_time};
+use crate::time::get_time;
 
 use std::{cell::RefCell, collections::HashMap};
 
@@ -89,14 +89,14 @@ pub fn end_gpu_query() {
 #[doc(hidden)]
 pub fn pause_gl_capture() {
     if PROFILER.with_borrow(|profiler| profiler.capture) {
-        crate::get_context().gl.capture(false);
+        crate::with_context(|context| context.gl.capture(false));
     }
 }
 
 /// Workaround to stop gl capture on debug rendering
 pub fn resume_gl_capture() {
     if PROFILER.with_borrow(|profiler| profiler.capture) {
-        crate::get_context().gl.capture(false);
+        crate::with_context(|context| context.gl.capture(false));
     }
 }
 
@@ -105,7 +105,7 @@ pub(crate) fn reset() {
     let capture = PROFILER.with_borrow_mut(|profiler| profiler.reset(frame_time));
     // Apply rendering state only after releasing the profiler borrow.
     if let Some(capture) = capture {
-        get_context().gl.capture(capture);
+        crate::with_context(|context| context.gl.capture(capture));
     }
 }
 
@@ -175,6 +175,15 @@ struct Profiler {
     enable_request: Option<bool>,
     drawcalls: Vec<DrawCallTelemetry>,
     strings: Vec<String>,
+}
+
+pub(crate) fn shutdown() {
+    // Raw capture/query IDs belong to the ending native graphics context. Do
+    // not retain them in TLS for a later session. Native teardown releases them;
+    // ElapsedQuery has no GPU-calling destructor, including on forced exits.
+    let previous =
+        PROFILER.with_borrow_mut(|profiler| std::mem::replace(profiler, Profiler::new()));
+    drop(previous);
 }
 
 impl Profiler {
@@ -325,7 +334,7 @@ impl<'a> LogTimeGuard<'a> {
     pub fn new(name: &'a str) -> LogTimeGuard<'a> {
         LogTimeGuard {
             name,
-            start_time: get_time(),
+            start_time: miniquad::date::now(),
         }
     }
 }
@@ -335,7 +344,7 @@ impl<'a> Drop for LogTimeGuard<'a> {
         log_string(&format!(
             "Time query: {}, {:.1}s",
             self.name,
-            get_time() - self.start_time
+            miniquad::date::now() - self.start_time
         ));
     }
 }
@@ -354,11 +363,11 @@ pub fn strings() -> Vec<String> {
 
 /// Note that coroutines pre-allocate 56Kb, so 56000 as a result doesnt mean a leak
 pub fn coroutines_allocated_memory() -> usize {
-    get_context().coroutines_context.allocated_memory()
+    crate::with_context(|context| context.coroutines_context.clone()).allocated_memory()
 }
 
 pub fn active_coroutines_count() -> usize {
-    get_context().coroutines_context.active_coroutines_count()
+    crate::with_context(|context| context.coroutines_context.clone()).active_coroutines_count()
 }
 
 pub fn capture_frame() {
@@ -399,7 +408,7 @@ pub(crate) fn track_drawcall(
 }
 
 pub fn textures_count() -> usize {
-    get_context().textures.len()
+    crate::with_context(|context| context.textures.len())
 }
 
 #[cfg(test)]

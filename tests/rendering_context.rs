@@ -73,6 +73,18 @@ async fn rendering_uses_explicit_backend_and_texture_lookup() {
         .chunks_exact(4)
         .any(|p| p[0] > 0));
 
+    // Cube faces must use the renderer already borrowed by the primitive.
+    set_camera(&Camera2D {
+        render_target: Some(target.clone()),
+        ..Camera2D::from_display_rect(Rect::new(0., 0., 64., 64.))
+    });
+    clear_background(BLACK);
+    draw_cube(vec3(32., 32., 0.), vec3(32., 32., 1.), None, red);
+    set_default_camera();
+    let pixels = target.texture.get_texture_data();
+    assert_eq!(pixels.get_pixel(32, 32), red);
+    assert_eq!(pixels.get_pixel(0, 0), BLACK);
+
     // This frame initializes the UI material and uploads its font atlas.
     root_ui().label(Some(vec2(4., 4.)), "First UI frame");
     telemetry::capture_frame();

@@ -460,7 +460,7 @@ pub(crate) fn shutdown() {
     shutdown_with(crate::experimental::coroutines::stop_all_coroutines);
 }
 
-fn shutdown_with(cancel: impl FnOnce()) {
+pub(crate) fn shutdown_with(cancel: impl FnOnce()) {
     let Some(id) = try_with_scene(|scene| {
         if scene.shutting_down {
             return None;

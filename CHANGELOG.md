@@ -12,6 +12,19 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 8 of the context safety plan: replace `static mut CONTEXT` and
+  unrestricted context/backend getters with checked, scoped thread-local access,
+  removing the four remaining `static_mut_refs` warnings. Reject overlapping
+  windows and release thread ownership after explicit session teardown. Drop
+  futures, scene/UI state, and recovery handlers outside context borrows; cancel
+  tasks created during cleanup, drain disposal queues, and release the backend
+  last. Forced exits close queues without accessing an unavailable backend.
+  Queue sound disposal, reject stale coroutine/resource sessions, and reset
+  profiler state. Preserve screenshot, touch dispatch, cube rendering, and
+  uniform-destructor reentry. Add lifecycle, panic, session-isolation,
+  cube-pixel, and real-audio regressions.
+  Ordinary public signatures are unchanged; game/performance verification
+  remains step 9.
 - Complete step 7 of the context safety plan: root UI guards retain independent
   storage, reject conflicting access, and release correctly on unwind. Scoped
   GL access prevents escaping renderer/backend references and rejects engine
@@ -103,7 +116,8 @@ this changelog's scope. Dates below are commit dates, not release dates.
   shutdown removes all nodes. Optional access to an inactive scene returns
   absence/defaults instead of implicitly constructing a scene.
 - Coroutine stopping cancels the current snapshot; futures created by its
-  destructors remain scheduled. Full scheduler/context migration is still pending.
+  destructors remain scheduled. Engine shutdown additionally closes the scheduler
+  and cancels tasks created during cleanup.
 - The explicit tween type is now `LinearTweenFuture<T, T1, F>`; inferred
   `linear(...)` calls remain supported. Projection closures are retained and run
   each poll, so their captures determine the future's lifetime and `Send` bounds.

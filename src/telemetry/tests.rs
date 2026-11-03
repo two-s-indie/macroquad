@@ -5,6 +5,23 @@ fn fresh_profiler() {
     PROFILER.with_borrow_mut(|profiler| *profiler = Profiler::new());
 }
 
+#[test]
+fn shutdown_clears_session_state_and_stale_gpu_identifiers() {
+    fresh_profiler();
+    PROFILER.with_borrow_mut(|profiler| {
+        profiler.enabled = true;
+        profiler.capture = true;
+        profiler.capture_request = true;
+        profiler.drawcalls.push(recorded_drawcall(3));
+        profiler.strings.push("old session".into());
+    });
+    shutdown();
+    assert!(!is_enabled());
+    assert!(drawcalls().is_empty());
+    assert!(strings().is_empty());
+    assert_eq!(finish_frame(1.), None);
+}
+
 fn finish_frame(frame_time: f32) -> Option<bool> {
     PROFILER.with_borrow_mut(|profiler| profiler.reset(frame_time))
 }

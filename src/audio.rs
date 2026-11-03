@@ -2,7 +2,11 @@
 
 #![allow(dead_code)]
 
-use crate::{file::load_file, get_context, Error};
+use crate::{
+    file::load_file,
+    resource_disposal::{DisposalQueue, DisposalSender},
+    Error,
+};
 use std::sync::Arc;
 
 #[cfg(feature = "audio")]
@@ -64,13 +68,32 @@ pub struct PlaySoundParams {
 
 pub struct AudioContext {
     native_ctx: QuadSndContext,
+    disposal: DisposalQueue<QuadSndSound>,
 }
 
 impl AudioContext {
     pub fn new() -> AudioContext {
         AudioContext {
             native_ctx: QuadSndContext::new(),
+            disposal: DisposalQueue::new(),
         }
+    }
+
+    pub(crate) fn garbage_collect(&self) {
+        for sound in self.disposal.take() {
+            sound.delete(&self.native_ctx);
+        }
+    }
+
+    pub(crate) fn close_disposal(&self) {
+        self.disposal.close();
+    }
+
+    fn validate(&self, sound: &Sound) {
+        assert!(
+            self.disposal.owns(&sound.0.disposal),
+            "sound belongs to another engine session"
+        );
     }
 
     #[cfg(target_os = "android")]
@@ -84,12 +107,14 @@ impl AudioContext {
     }
 }
 
-struct QuadSndSoundGuarded(QuadSndSound);
+struct QuadSndSoundGuarded {
+    sound: Option<QuadSndSound>,
+    disposal: DisposalSender<QuadSndSound>,
+}
 
 impl Drop for QuadSndSoundGuarded {
     fn drop(&mut self) {
-        let ctx = &get_context().audio_context;
-        self.0.delete(&ctx.native_ctx);
+        self.disposal.send(self.sound.take().unwrap());
     }
 }
 
@@ -116,25 +141,26 @@ pub async fn load_sound(path: &str) -> Result<Sound, Error> {
 ///
 /// Attempts to automatically detect the format of the source of data.
 pub async fn load_sound_from_bytes(data: &[u8]) -> Result<Sound, Error> {
-    let sound = {
-        let ctx = &mut get_context().audio_context;
-        QuadSndSound::load(&mut ctx.native_ctx, data)
-    };
+    let sound = crate::with_context(|context| {
+        let ctx = &mut context.audio_context;
+        Sound(Arc::new(QuadSndSoundGuarded {
+            sound: Some(QuadSndSound::load(&mut ctx.native_ctx, data)),
+            disposal: ctx.disposal.sender(),
+        }))
+    });
 
     // only on wasm the sound is not ready right away
     #[cfg(target_arch = "wasm32")]
-    while sound.is_loaded() == false {
+    while sound.0.sound.as_ref().unwrap().is_loaded() == false {
         crate::window::next_frame().await;
     }
 
-    Ok(Sound(Arc::new(QuadSndSoundGuarded(sound))))
+    Ok(sound)
 }
 
 pub fn play_sound_once(sound: &Sound) {
-    let ctx = &mut get_context().audio_context;
-
-    sound.0 .0.play(
-        &mut ctx.native_ctx,
+    play_sound(
+        sound,
         PlaySoundParams {
             looped: false,
             volume: 1.0,
@@ -143,16 +169,35 @@ pub fn play_sound_once(sound: &Sound) {
 }
 
 pub fn play_sound(sound: &Sound, params: PlaySoundParams) {
-    let ctx = &mut get_context().audio_context;
-    sound.0 .0.play(&mut ctx.native_ctx, params);
+    crate::with_context(|context| {
+        let ctx = &mut context.audio_context;
+        ctx.validate(sound);
+        sound
+            .0
+            .sound
+            .as_ref()
+            .unwrap()
+            .play(&mut ctx.native_ctx, params);
+    });
 }
 
 pub fn stop_sound(sound: &Sound) {
-    let ctx = &mut get_context().audio_context;
-    sound.0 .0.stop(&mut ctx.native_ctx);
+    crate::with_context(|context| {
+        let ctx = &mut context.audio_context;
+        ctx.validate(sound);
+        sound.0.sound.as_ref().unwrap().stop(&mut ctx.native_ctx);
+    });
 }
 
 pub fn set_sound_volume(sound: &Sound, volume: f32) {
-    let ctx = &mut get_context().audio_context;
-    sound.0 .0.set_volume(&mut ctx.native_ctx, volume);
+    crate::with_context(|context| {
+        let ctx = &mut context.audio_context;
+        ctx.validate(sound);
+        sound
+            .0
+            .sound
+            .as_ref()
+            .unwrap()
+            .set_volume(&mut ctx.native_ctx, volume);
+    });
 }

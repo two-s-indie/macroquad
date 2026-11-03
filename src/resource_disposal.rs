@@ -7,6 +7,7 @@ struct State<T> {
     owner: ThreadId,
     pending: Mutex<Option<Vec<T>>>,
     has_pending: AtomicBool,
+    closed: AtomicBool,
 }
 
 pub(crate) struct DisposalQueue<T>(Arc<State<T>>);
@@ -36,6 +37,7 @@ impl<T> DisposalQueue<T> {
             owner: thread::current().id(),
             pending: Mutex::new(Some(Vec::new())),
             has_pending: AtomicBool::new(false),
+            closed: AtomicBool::new(false),
         }))
     }
 
@@ -65,6 +67,7 @@ impl<T> DisposalQueue<T> {
 
     // No GPU calls. Closing and dropping the owner make all late sends no-ops.
     pub(crate) fn close(&self) {
+        self.0.closed.store(true, Ordering::Release);
         let pending = self.0.pending.lock().unwrap().take();
         self.0.has_pending.store(false, Ordering::Release);
         drop(pending); // Never run destructors with the queue locked.
@@ -78,6 +81,19 @@ impl<T> Drop for DisposalQueue<T> {
 }
 
 impl<T> DisposalSender<T> {
+    pub(crate) fn assert_active(&self) {
+        let state = self.0.upgrade().expect("resource session has ended");
+        assert_eq!(
+            state.owner,
+            thread::current().id(),
+            "resource used off its owner thread"
+        );
+        assert!(
+            !state.closed.load(Ordering::Acquire),
+            "resource session has ended"
+        );
+    }
+
     pub(crate) fn send(&self, value: T) {
         let Some(state) = self.0.upgrade() else {
             return;
@@ -100,6 +116,22 @@ impl<T> DisposalSender<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn resource_use_rejects_closed_expired_and_foreign_threads() {
+        let queue = DisposalQueue::<()>::new();
+        let sender = queue.sender();
+        sender.assert_active();
+        let foreign = sender.clone();
+        assert!(thread::spawn(move || foreign.assert_active())
+            .join()
+            .is_err());
+        sender.assert_active();
+        queue.close();
+        assert!(std::panic::catch_unwind(|| sender.assert_active()).is_err());
+        drop(queue);
+        assert!(std::panic::catch_unwind(|| sender.assert_active()).is_err());
+    }
 
     #[test]
     fn old_senders_cannot_reach_a_new_session() {

@@ -4,7 +4,6 @@ use std::collections::HashMap;
 
 use crate::{
     color::Color,
-    get_context,
     math::{vec3, Rect},
     texture::{Image, TextureHandle},
     Error,
@@ -225,12 +224,6 @@ impl Font {
     pub fn set_filter(&mut self, filter_mode: miniquad::FilterMode) {
         self.atlas.lock().unwrap().set_filter(filter_mode);
     }
-
-    // pub fn texture(&self) -> Texture2D {
-    //     let font = get_context().fonts_storage.get_font(*self);
-
-    //     font.font_texture
-    // }
 }
 
 impl Default for Font {
@@ -285,23 +278,24 @@ pub async fn load_ttf_font(path: &str) -> Result<Font, Error> {
 /// let font = load_ttf_font_from_bytes(include_bytes!("font.ttf"));
 /// ```
 pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
-    let ctx = get_context();
-    let atlas = Arc::new(Mutex::new(Atlas::new(
-        &mut *ctx.quad_context,
-        miniquad::FilterMode::Linear,
-        ctx.textures.disposal(),
-    )));
+    crate::with_context(|ctx| {
+        let atlas = Arc::new(Mutex::new(Atlas::new(
+            &mut *ctx.quad_context,
+            miniquad::FilterMode::Linear,
+            ctx.textures.disposal(),
+        )));
 
-    let font = Font::load_from_bytes(atlas.clone(), bytes)?;
+        let font = Font::load_from_bytes(atlas.clone(), bytes)?;
 
-    font.populate_font_cache(&Font::ascii_character_list(), 15);
+        font.populate_font_cache(&Font::ascii_character_list(), 15);
 
-    font.atlas
-        .lock()
-        .unwrap()
-        .set_filter_with(&mut *ctx.quad_context, ctx.default_filter_mode);
+        font.atlas
+            .lock()
+            .unwrap()
+            .set_filter_with(&mut *ctx.quad_context, ctx.default_filter_mode);
 
-    Ok(font)
+        Ok(font)
+    })
 }
 
 /// Draw text with given font_size
@@ -335,91 +329,93 @@ pub fn draw_text_ex(text: impl AsRef<str>, x: f32, y: f32, params: TextParams) -
         return TextDimensions::default();
     }
 
-    let context = get_context();
-    let font = params
-        .font
-        .cloned()
-        .unwrap_or_else(|| context.fonts_storage.default_font.clone());
+    crate::with_context(|context| {
+        let font = params
+            .font
+            .cloned()
+            .unwrap_or_else(|| context.fonts_storage.default_font.clone());
 
-    let dpi_scaling = miniquad::window::dpi_scale();
+        let dpi_scaling = miniquad::window::dpi_scale();
 
-    let rot = params.rotation;
-    let font_scale_x = params.font_scale * params.font_scale_aspect;
-    let font_scale_y = params.font_scale;
-    let font_size = (params.font_size as f32 * dpi_scaling).ceil() as u16;
-    let font_size_f32 = font_size as f32;
+        let rot = params.rotation;
+        let font_scale_x = params.font_scale * params.font_scale_aspect;
+        let font_scale_y = params.font_scale;
+        let font_size = (params.font_size as f32 * dpi_scaling).ceil() as u16;
+        let font_size_f32 = font_size as f32;
 
-    let mut total_width = 0.0;
-    let mut max_offset_y = f32::MIN;
-    let mut min_offset_y = f32::MAX;
+        let mut total_width = 0.0;
+        let mut max_offset_y = f32::MIN;
+        let mut min_offset_y = f32::MAX;
 
-    let mut last_character = None;
+        let mut last_character = None;
 
-    for character in text.chars() {
-        if !font.contains(character, font_size) {
-            font.cache_glyph(character, font_size);
+        for character in text.chars() {
+            if !font.contains(character, font_size) {
+                font.cache_glyph(character, font_size);
+            }
+
+            let kerning_offset = last_character
+                .and_then(|left| font.font.horizontal_kern(left, character, font_size_f32))
+                .unwrap_or(0.0);
+            last_character = Some(character);
+
+            let char_data = &font.characters.lock().unwrap()[&(character, font_size)];
+            let offset_x = char_data.offset_x as f32 * font_scale_x;
+            let offset_y = char_data.offset_y as f32 * font_scale_y;
+
+            let mut atlas = font.atlas.lock().unwrap();
+            let glyph = atlas.get(char_data.sprite).unwrap().rect;
+            let glyph_scaled_h = glyph.h * font_scale_y;
+
+            min_offset_y = min_offset_y.min(offset_y);
+            max_offset_y = max_offset_y.max(glyph_scaled_h + offset_y);
+
+            let rot_cos = rot.cos();
+            let rot_sin = rot.sin();
+            let dest_x = (offset_x + total_width) * rot_cos + (glyph_scaled_h + offset_y) * rot_sin;
+            let dest_y =
+                (offset_x + total_width) * rot_sin + (-glyph_scaled_h - offset_y) * rot_cos;
+
+            // Kerning shifts along the text-flow direction. At `rot = 0`
+            // text flows along +X, so the offset goes into dest.x; at
+            // 90° / 270° text flows along ±Y, so it needs to go into
+            // dest.y instead. Multiplying by (rot_cos, rot_sin) routes
+            // the offset into the correct axis for any rotation.
+            let kerning_logical = kerning_offset / dpi_scaling;
+            let dest = Rect::new(
+                dest_x / dpi_scaling + x + kerning_logical * rot_cos,
+                dest_y / dpi_scaling + y + kerning_logical * rot_sin,
+                glyph.w / dpi_scaling * font_scale_x,
+                glyph.h / dpi_scaling * font_scale_y,
+            );
+
+            total_width += char_data.advance * font_scale_x + kerning_offset;
+
+            let texture = crate::texture::Texture2D {
+                texture: TextureHandle::Unmanaged(atlas.texture_with(&mut *context.quad_context)),
+            };
+            crate::texture::draw_texture_ex_with(
+                context,
+                &texture,
+                dest.x,
+                dest.y,
+                params.color,
+                crate::texture::DrawTextureParams {
+                    dest_size: Some(vec2(dest.w, dest.h)),
+                    source: Some(glyph),
+                    rotation: rot,
+                    pivot: Some(vec2(dest.x, dest.y)),
+                    ..Default::default()
+                },
+            );
         }
 
-        let kerning_offset = last_character
-            .and_then(|left| font.font.horizontal_kern(left, character, font_size_f32))
-            .unwrap_or(0.0);
-        last_character = Some(character);
-
-        let char_data = &font.characters.lock().unwrap()[&(character, font_size)];
-        let offset_x = char_data.offset_x as f32 * font_scale_x;
-        let offset_y = char_data.offset_y as f32 * font_scale_y;
-
-        let mut atlas = font.atlas.lock().unwrap();
-        let glyph = atlas.get(char_data.sprite).unwrap().rect;
-        let glyph_scaled_h = glyph.h * font_scale_y;
-
-        min_offset_y = min_offset_y.min(offset_y);
-        max_offset_y = max_offset_y.max(glyph_scaled_h + offset_y);
-
-        let rot_cos = rot.cos();
-        let rot_sin = rot.sin();
-        let dest_x = (offset_x + total_width) * rot_cos + (glyph_scaled_h + offset_y) * rot_sin;
-        let dest_y = (offset_x + total_width) * rot_sin + (-glyph_scaled_h - offset_y) * rot_cos;
-
-        // Kerning shifts along the text-flow direction. At `rot = 0`
-        // text flows along +X, so the offset goes into dest.x; at
-        // 90° / 270° text flows along ±Y, so it needs to go into
-        // dest.y instead. Multiplying by (rot_cos, rot_sin) routes
-        // the offset into the correct axis for any rotation.
-        let kerning_logical = kerning_offset / dpi_scaling;
-        let dest = Rect::new(
-            dest_x / dpi_scaling + x + kerning_logical * rot_cos,
-            dest_y / dpi_scaling + y + kerning_logical * rot_sin,
-            glyph.w / dpi_scaling * font_scale_x,
-            glyph.h / dpi_scaling * font_scale_y,
-        );
-
-        total_width += char_data.advance * font_scale_x + kerning_offset;
-
-        let texture = crate::texture::Texture2D {
-            texture: TextureHandle::Unmanaged(atlas.texture_with(&mut *context.quad_context)),
-        };
-        crate::texture::draw_texture_ex_with(
-            context,
-            &texture,
-            dest.x,
-            dest.y,
-            params.color,
-            crate::texture::DrawTextureParams {
-                dest_size: Some(vec2(dest.w, dest.h)),
-                source: Some(glyph),
-                rotation: rot,
-                pivot: Some(vec2(dest.x, dest.y)),
-                ..Default::default()
-            },
-        );
-    }
-
-    TextDimensions {
-        width: total_width / dpi_scaling,
-        height: (max_offset_y - min_offset_y) / dpi_scaling,
-        offset_y: max_offset_y / dpi_scaling,
-    }
+        TextDimensions {
+            width: total_width / dpi_scaling,
+            height: (max_offset_y - min_offset_y) / dpi_scaling,
+            offset_y: max_offset_y / dpi_scaling,
+        }
+    })
 }
 
 /// Draw multiline text with the given font_size, line_distance_factor and color.
@@ -513,7 +509,14 @@ pub fn measure_text(
     font_size: u16,
     font_scale: f32,
 ) -> TextDimensions {
-    let font = font.unwrap_or_else(|| &get_context().fonts_storage.default_font);
+    let default_font;
+    let font = match font {
+        Some(font) => font,
+        None => {
+            default_font = get_default_font();
+            &default_font
+        }
+    };
 
     font.measure_text(text, font_size, font_scale, font_scale, |_| {})
 }
@@ -525,7 +528,14 @@ pub fn measure_multiline_text(
     font_scale: f32,
     line_distance_factor: Option<f32>,
 ) -> TextDimensions {
-    let font = font.unwrap_or_else(|| &get_context().fonts_storage.default_font);
+    let default_font;
+    let font = match font {
+        Some(font) => font,
+        None => {
+            default_font = get_default_font();
+            &default_font
+        }
+    };
     let line_distance = match line_distance_factor {
         Some(distance) => distance,
         None => match font.font.horizontal_line_metrics(1.0) {
@@ -558,7 +568,14 @@ pub fn wrap_text(
     font_scale: f32,
     maximum_line_length: f32,
 ) -> String {
-    let font = font.unwrap_or_else(|| &get_context().fonts_storage.default_font);
+    let default_font;
+    let font = match font {
+        Some(font) => font,
+        None => {
+            default_font = get_default_font();
+            &default_font
+        }
+    };
 
     // This is always a bit too much memory, but it saves a lot of reallocations.
     let mut new_text =
@@ -642,31 +659,32 @@ impl FontsStorage {
 
 /// Returns macroquads default font.
 pub fn get_default_font() -> Font {
-    let context = get_context();
-    context.fonts_storage.default_font.clone()
+    crate::with_context(|context| context.fonts_storage.default_font.clone())
 }
 
 /// Replaces macroquads default font with `font`.
 pub fn set_default_font(font: Font) {
-    let context = get_context();
-    context.fonts_storage.default_font = font;
+    crate::with_context(|context| {
+        context.fonts_storage.default_font = font;
+    })
 }
 
 /// From given font size in world space gives
 /// (font_size, font_scale and font_aspect) params to make rasterized font
 /// looks good in currently active camera
 pub fn camera_font_scale(world_font_size: f32) -> (u16, f32, f32) {
-    let context = get_context();
-    let (scr_w, scr_h) = miniquad::window::screen_size();
-    let cam_space = context
-        .projection_matrix()
-        .inverse()
-        .transform_vector3(vec3(2., 2., 0.));
-    let (cam_w, cam_h) = (cam_space.x.abs(), cam_space.y.abs());
+    crate::with_context(|context| {
+        let (scr_w, scr_h) = miniquad::window::screen_size();
+        let cam_space = context
+            .projection_matrix()
+            .inverse()
+            .transform_vector3(vec3(2., 2., 0.));
+        let (cam_w, cam_h) = (cam_space.x.abs(), cam_space.y.abs());
 
-    let screen_font_size = world_font_size * scr_h / cam_h;
+        let screen_font_size = world_font_size * scr_h / cam_h;
 
-    let font_size = screen_font_size as u16;
+        let font_size = screen_font_size as u16;
 
-    (font_size, cam_h / scr_h, scr_h / scr_w * cam_w / cam_h)
+        (font_size, cam_h / scr_h, scr_h / scr_w * cam_w / cam_h)
+    })
 }

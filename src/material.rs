@@ -1,6 +1,6 @@
 //! Custom materials - shaders, uniforms.
 
-use crate::{get_context, quad_gl::GlPipeline, texture::Texture2D, tobytes::ToBytes, Error};
+use crate::{quad_gl::GlPipeline, texture::Texture2D, tobytes::ToBytes, Error};
 use miniquad::{PipelineParams, UniformDesc};
 use std::sync::Arc;
 
@@ -29,24 +29,38 @@ impl std::fmt::Debug for Material {
 }
 
 impl Material {
+    fn validate(&self, gl: &crate::quad_gl::QuadGl) {
+        assert!(
+            gl.owns_material(&self.pipeline.1),
+            "material belongs to another engine session"
+        );
+    }
     pub(crate) fn apply(&self, gl: &mut crate::quad_gl::QuadGl) {
+        self.validate(gl);
         gl.pipeline(Some(self.pipeline.0));
     }
     /// Set GPU uniform value for this material.
     /// "name" should be from "uniforms" list used for material creation.
     /// Otherwise uniform value would be silently ignored.
     pub fn set_uniform<T>(&self, name: &str, uniform: T) {
-        get_context().gl.set_uniform(self.pipeline.0, name, uniform);
+        crate::with_context(|context| {
+            self.validate(&context.gl);
+            context.gl.set_uniform_ref(self.pipeline.0, name, &uniform);
+        });
     }
 
     pub fn set_uniform_array<T: ToBytes>(&self, name: &str, uniform: &[T]) {
-        get_context()
-            .gl
-            .set_uniform_array(self.pipeline.0, name, uniform);
+        crate::with_context(|context| {
+            self.validate(&context.gl);
+            context.gl.set_uniform_array(self.pipeline.0, name, uniform);
+        });
     }
 
     pub fn set_texture(&self, name: &str, texture: Texture2D) {
-        get_context().gl.set_texture(self.pipeline.0, name, texture);
+        crate::with_context(|context| {
+            self.validate(&context.gl);
+            context.gl.set_texture(self.pipeline.0, name, texture);
+        });
     }
 }
 
@@ -129,8 +143,9 @@ pub fn load_material(
     shader: crate::ShaderSource,
     params: MaterialParams,
 ) -> Result<Material, Error> {
-    let context = get_context();
-    load_material_with(&mut *context.quad_context, &mut context.gl, shader, params)
+    crate::with_context(|context| {
+        load_material_with(&mut *context.quad_context, &mut context.gl, shader, params)
+    })
 }
 
 pub(crate) fn load_material_with(
@@ -154,12 +169,12 @@ pub(crate) fn load_material_with(
 
 /// All following macroquad rendering calls will use the given material.
 pub fn gl_use_material(material: &Material) {
-    material.apply(&mut get_context().gl);
+    crate::with_context(|context| material.apply(&mut context.gl));
 }
 
 /// Use default macroquad material.
 pub fn gl_use_default_material() {
-    get_context().gl.pipeline(None);
+    crate::with_context(|context| context.gl.pipeline(None));
 }
 
 #[doc(hidden)]

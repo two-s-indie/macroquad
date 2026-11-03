@@ -2,11 +2,33 @@
 pub struct GenerationalId {
     id: usize,
     generation: usize,
+    storage: usize,
+}
+
+impl GenerationalId {
+    pub(crate) fn cancelled() -> Self {
+        Self {
+            id: 0,
+            generation: 0,
+            storage: 0,
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::GenerationalStorage;
+
+    #[test]
+    fn handles_never_address_slots_in_another_session() {
+        let old = GenerationalStorage::new().push(1);
+        let mut new = GenerationalStorage::new();
+        let current = new.push(2);
+        assert!(new.get(old).is_none());
+        assert!(new.get_mut(old).is_none());
+        assert!(new.take(old).is_none());
+        assert_eq!(new.get(current), Some(&2));
+    }
 
     #[test]
     fn freeing_a_handle_twice_does_not_duplicate_a_free_slot() {
@@ -75,13 +97,20 @@ struct GenerationalCell<T> {
 }
 
 pub(crate) struct GenerationalStorage<T> {
+    identity: usize,
     vec: Vec<Option<GenerationalCell<T>>>,
     free_indices: Vec<(usize, usize)>,
 }
 
 impl<T> GenerationalStorage<T> {
     pub fn new() -> GenerationalStorage<T> {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        static NEXT: AtomicUsize = AtomicUsize::new(1);
+        let identity = NEXT
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| id.checked_add(1))
+            .expect("coroutine storage identities exhausted");
         GenerationalStorage {
+            identity,
             vec: Vec::with_capacity(1000),
             free_indices: Vec::with_capacity(100),
         }
@@ -108,10 +137,17 @@ impl<T> GenerationalStorage<T> {
             self.vec.len() - 1
         };
 
-        GenerationalId { id, generation }
+        GenerationalId {
+            id,
+            generation,
+            storage: self.identity,
+        }
     }
 
     pub fn get(&self, id: GenerationalId) -> Option<&T> {
+        if id.storage != self.identity {
+            return None;
+        }
         let cell = self.vec.get(id.id)?.as_ref()?;
         if cell.generation != id.generation {
             return None;
@@ -121,6 +157,9 @@ impl<T> GenerationalStorage<T> {
     }
 
     pub fn get_mut(&mut self, id: GenerationalId) -> Option<&mut T> {
+        if id.storage != self.identity {
+            return None;
+        }
         let cell = self.vec.get_mut(id.id)?.as_mut()?;
         if cell.generation != id.generation {
             return None;
@@ -141,6 +180,7 @@ impl<T> GenerationalStorage<T> {
                 cell.as_ref().map(|cell| GenerationalId {
                     id,
                     generation: cell.generation,
+                    storage: self.identity,
                 })
             })
             .collect()

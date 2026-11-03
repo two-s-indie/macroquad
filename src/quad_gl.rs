@@ -299,6 +299,10 @@ struct PipelineExt {
 
 impl PipelineExt {
     fn set_uniform<T>(&mut self, name: &str, uniform: T) {
+        self.set_uniform_ref(name, &uniform);
+    }
+
+    fn set_uniform_ref<T>(&mut self, name: &str, uniform: &T) {
         let uniform_meta = self.uniforms.iter().find(
             |Uniform {
                  name: uniform_name, ..
@@ -329,7 +333,7 @@ impl PipelineExt {
         macro_rules! transmute_uniform {
             ($uniform_size:expr, $byte_offset:expr, $n:expr) => {
                 if $uniform_size == $n {
-                    let data: [u8; $n] = unsafe { std::mem::transmute_copy(&uniform) };
+                    let data: [u8; $n] = unsafe { std::mem::transmute_copy(uniform) };
 
                     for i in 0..$uniform_size {
                         self.uniforms_data[$byte_offset + i] = data[i];
@@ -1012,6 +1016,13 @@ impl QuadGl {
         self.disposal.sender()
     }
 
+    pub(crate) fn owns_material(
+        &self,
+        sender: &crate::resource_disposal::DisposalSender<GlPipeline>,
+    ) -> bool {
+        self.disposal.owns(sender)
+    }
+
     fn retire_disposed_pipelines(&mut self) {
         for pipeline in self.disposal.take() {
             self.delete_pipeline(pipeline);
@@ -1029,11 +1040,15 @@ impl QuadGl {
     }
 
     pub fn set_uniform<T>(&mut self, pipeline: GlPipeline, name: &str, uniform: T) {
+        self.set_uniform_ref(pipeline, name, &uniform);
+    }
+
+    pub(crate) fn set_uniform_ref<T>(&mut self, pipeline: GlPipeline, name: &str, uniform: &T) {
         self.state.break_batching = true;
 
         self.pipelines
             .get_quad_pipeline_mut(pipeline)
-            .set_uniform(name, uniform);
+            .set_uniform_ref(name, uniform);
     }
     pub fn set_uniform_array<T: ToBytes>(
         &mut self,

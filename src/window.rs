@@ -1,7 +1,5 @@
 //! Window and associated to window rendering context related functions.
 
-use crate::get_context;
-
 use crate::color::Color;
 
 // miniquad is re-exported for use with `with_internal_gl`.
@@ -20,17 +18,18 @@ pub fn next_frame() -> crate::exec::FrameFuture {
 /// Note: even when "clear_background" is not called explicitly,
 /// the screen will be cleared at the beginning of the frame.
 pub fn clear_background(color: Color) {
-    let context = get_context();
-
-    context.gl.clear(&mut *context.quad_context, color);
+    crate::with_context(|context| {
+        context.gl.clear(&mut *context.quad_context, color);
+    })
 }
 
 #[doc(hidden)]
 pub fn gl_set_drawcall_buffer_capacity(max_vertices: usize, max_indices: usize) {
-    let context = get_context();
-    context
-        .gl
-        .update_drawcall_capacity(&mut *context.quad_context, max_vertices, max_indices);
+    crate::with_context(|context| {
+        context
+            .gl
+            .update_drawcall_capacity(&mut *context.quad_context, max_vertices, max_indices);
+    })
 }
 
 /// Scoped renderer/backend access supplied by [`with_internal_gl`].
@@ -85,28 +84,6 @@ impl<'a> InternalGlContext<'a> {
     }
 }
 
-thread_local! {
-    static INTERNAL_GL_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
-
-// Temporary boundary until step 8 makes every context borrow scoped. Check this
-// before creating any context/backend reference, not after borrowing the global.
-pub(crate) fn assert_context_available() {
-    INTERNAL_GL_ACTIVE.with(|active| {
-        assert!(
-            !active.get(),
-            "engine context is already borrowed by with_internal_gl; use the supplied GL access"
-        )
-    });
-}
-
-struct InternalGlScope;
-impl Drop for InternalGlScope {
-    fn drop(&mut self) {
-        INTERNAL_GL_ACTIVE.with(|active| active.set(false));
-    }
-}
-
 /// Access the renderer and backend for the duration of a synchronous closure.
 /// Replaces the unsafe, unconstrained references returned by `get_internal_gl`.
 ///
@@ -137,32 +114,28 @@ impl Drop for InternalGlScope {
 /// let future = with_internal_gl(|mut gl| async move { gl.flush() });
 /// ```
 pub fn with_internal_gl<R>(f: impl FnOnce(InternalGlContext<'_>) -> R) -> R {
-    let context = get_context();
-    INTERNAL_GL_ACTIVE.with(|active| active.set(true));
-    let _scope = InternalGlScope;
-    let projection = context.projection_matrix();
-    let dpi = miniquad::window::dpi_scale();
-    let screen_size = (context.screen_width / dpi, context.screen_height / dpi);
-    f(InternalGlContext {
-        quad_context: &mut *context.quad_context,
-        quad_gl: &mut context.gl,
-        textures: &context.textures,
-        projection,
-        screen_size,
+    crate::with_context(|context| {
+        let projection = context.projection_matrix();
+        let dpi = miniquad::window::dpi_scale();
+        let screen_size = (context.screen_width / dpi, context.screen_height / dpi);
+        f(InternalGlContext {
+            quad_context: &mut *context.quad_context,
+            quad_gl: &mut context.gl,
+            textures: &context.textures,
+            projection,
+            screen_size,
+        })
     })
 }
 
 /// Logical client width: framebuffer pixels divided by the current rendering DPI scale.
 pub fn screen_width() -> f32 {
-    let context = get_context();
-    context.screen_width / miniquad::window::dpi_scale()
+    crate::with_context(|context| context.screen_width / miniquad::window::dpi_scale())
 }
 
 /// Logical client height: framebuffer pixels divided by the current rendering DPI scale.
 pub fn screen_height() -> f32 {
-    let context = get_context();
-
-    context.screen_height / miniquad::window::dpi_scale()
+    crate::with_context(|context| context.screen_height / miniquad::window::dpi_scale())
 }
 
 /// Current rendering scale supplied by Miniquad. It can change while the window is open.
@@ -233,9 +206,10 @@ where
     let handler: RecoveryHandler =
         std::sync::Arc::new(move |message, backtrace| Box::pin(future(message, backtrace)));
     let previous = {
-        let context = crate::get_context();
-        context.unwind = true;
-        context.recovery_handler.replace(handler)
+        crate::with_context(|context| {
+            context.unwind = true;
+            context.recovery_handler.replace(handler)
+        })
     };
     drop(previous);
     PANIC_INFO.with(|info| *info.borrow_mut() = None);
@@ -270,7 +244,7 @@ thread_local! {
 
 pub(crate) fn take_recovery_future(
 ) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> {
-    let handler = crate::get_context().recovery_handler.clone()?;
+    let handler = crate::with_context(|context| context.recovery_handler.clone())?;
     let (message, backtrace) = PANIC_INFO.with(|info| info.borrow_mut().take())?;
     Some(handler(message, backtrace))
 }

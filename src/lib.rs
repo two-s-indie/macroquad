@@ -43,6 +43,8 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 
+mod context;
+use context::with as with_context;
 mod exec;
 mod quad_gl;
 mod tobytes;
@@ -156,61 +158,7 @@ use crate::{
 
 use glam::{vec2, Mat4, Vec2};
 
-pub(crate) mod thread_assert {
-    use std::sync::RwLock;
-
-    static THREAD_ID: RwLock<Option<std::thread::ThreadId>> = RwLock::new(None);
-
-    pub fn set_thread_id() {
-        let thread_id = std::thread::current().id();
-        *THREAD_ID
-            .write()
-            .expect("Macroquad thread ID lock poisoned") = Some(thread_id);
-    }
-
-    pub fn same_thread() {
-        thread_local! {
-            static CURRENT_THREAD_ID: std::thread::ThreadId = std::thread::current().id();
-        }
-        // Release the read lock before checking the copied ID.
-        let thread_id = *THREAD_ID.read().expect("Macroquad thread ID lock poisoned");
-        assert_eq!(
-            thread_id.expect("Macroquad thread is not initialized"),
-            CURRENT_THREAD_ID.with(|id| *id),
-            "Macroquad accessed from a different thread"
-        );
-    }
-
-    #[cfg(all(test, not(target_arch = "wasm32")))]
-    mod tests {
-        use super::{same_thread, set_thread_id, THREAD_ID};
-        use std::{panic::catch_unwind, thread};
-
-        // Keep these checks together: they exercise the same global thread ID.
-        #[test]
-        fn thread_checks_allow_reinitialization_and_reject_wrong_threads() {
-            assert!(catch_unwind(same_thread).is_err());
-
-            set_thread_id();
-            same_thread();
-            assert!(thread::spawn(same_thread).join().is_err());
-            same_thread();
-
-            // A later window/test can initialize on another thread.
-            thread::spawn(|| {
-                set_thread_id();
-                same_thread();
-            })
-            .join()
-            .unwrap();
-            assert!(catch_unwind(same_thread).is_err());
-
-            set_thread_id();
-            same_thread();
-            *THREAD_ID.write().unwrap() = None;
-        }
-    }
-}
+mod thread_assert;
 struct Context {
     audio_context: audio::AudioContext,
 
@@ -242,7 +190,7 @@ struct Context {
     gl: QuadGl,
     camera_matrix: Option<Mat4>,
 
-    ui_context: UiContext,
+    ui_context: Option<UiContext>,
     coroutines_context: experimental::coroutines::CoroutinesContext,
     fonts_storage: text::FontsStorage,
 
@@ -387,7 +335,12 @@ impl Context {
                 draw_call_index_capacity,
             ),
 
-            ui_context: UiContext::new(&mut *ctx, screen_width, screen_height, textures.disposal()),
+            ui_context: Some(UiContext::new(
+                &mut *ctx,
+                screen_width,
+                screen_height,
+                textures.disposal(),
+            )),
             fonts_storage: text::FontsStorage::new(&mut *ctx, textures.disposal()),
             texture_batcher: texture::Batcher::new(&mut *ctx, textures.disposal()),
             camera_stack: vec![],
@@ -444,7 +397,7 @@ impl Context {
     fn end_frame(&mut self) {
         self.perform_render_passes();
 
-        self.ui_context.draw(
+        self.ui_context.as_mut().expect("UI has shut down").draw(
             &mut *self.quad_context,
             &mut self.gl,
             &self.textures,
@@ -468,6 +421,7 @@ impl Context {
         self.quit_requested = false;
 
         self.textures.garbage_collect(&mut *self.quad_context);
+        self.audio_context.garbage_collect();
 
         // remove all touches that were Ended or Cancelled
         self.touches.retain(|_, touch| {
@@ -523,24 +477,47 @@ impl Context {
         });
     }
 
-    fn finish_resource_disposal(&mut self) {
-        // Discard unfinished draws on exit, then retire materials before their
-        // textures and render-pass attachments. All backend work stays here.
-        self.gl.finish_disposal(&mut *self.quad_context);
-        self.textures.garbage_collect(&mut *self.quad_context);
-        self.textures.close_disposal();
-    }
-
     fn abandon_resource_disposal(&self) {
         // Backend availability is unknown on forced exits/unwind. Late drops
         // must remain CPU-only; native teardown owns remaining GPU resources.
         self.gl.close_disposal();
         self.textures.close_disposal();
+        self.audio_context.close_disposal();
+    }
+
+    fn destroy(self, backend_available: bool) {
+        if !backend_available {
+            self.abandon_resource_disposal();
+        }
+        let Context {
+            mut quad_context,
+            mut gl,
+            mut textures,
+            audio_context,
+            fonts_storage,
+            texture_batcher,
+            camera_stack,
+            ui_context,
+            recovery_handler,
+            coroutines_context,
+            ..
+        } = self;
+        // User-owned state was detached/dropped while the session was available.
+        // Remaining engine resources enqueue their disposal before the final drain.
+        drop((ui_context, recovery_handler, coroutines_context));
+        drop((fonts_storage, texture_batcher, camera_stack));
+        if backend_available {
+            gl.finish_disposal(&mut *quad_context);
+            textures.garbage_collect(&mut *quad_context);
+            audio_context.garbage_collect();
+        }
+        gl.close_disposal();
+        textures.close_disposal();
+        audio_context.close_disposal();
+        drop((gl, textures, audio_context));
+        drop(quad_context);
     }
 }
-
-#[no_mangle]
-static mut CONTEXT: Option<Context> = None;
 
 // This is required for #[macroquad::test]
 //
@@ -552,27 +529,11 @@ pub mod test {
     pub static ONCE: std::sync::Once = std::sync::Once::new();
 }
 
-fn get_context() -> &'static mut Context {
-    thread_assert::same_thread();
-    window::assert_context_available();
-
-    unsafe { CONTEXT.as_mut().unwrap_or_else(|| panic!()) }
-}
-
-fn get_quad_context() -> &'static mut dyn miniquad::RenderingBackend {
-    thread_assert::same_thread();
-    window::assert_context_available();
-
-    unsafe {
-        assert!(CONTEXT.is_some());
-    }
-
-    unsafe { &mut *CONTEXT.as_mut().unwrap().quad_context }
-}
-
 struct Stage {
     main_future: Pin<Box<dyn Future<Output = ()>>>,
     resources_closed: bool,
+    _owner: thread_assert::Registration,
+    _reservation: thread_assert::WindowReservation,
 }
 
 impl Stage {
@@ -581,48 +542,80 @@ impl Stage {
             return;
         }
         self.resources_closed = true;
-        // Normal completion/accepted quit clean up before backend teardown.
-        // Also finish scene cleanup if dropping the main future unwinds.
-        struct CloseDisposals;
-        impl Drop for CloseDisposals {
-            fn drop(&mut self) {
-                get_context().abandon_resource_disposal();
-            }
-        }
-        // Runs even if a user destructor panics during scene shutdown.
-        let _close = CloseDisposals;
-        struct ShutdownScene(bool);
-        impl Drop for ShutdownScene {
-            fn drop(&mut self) {
-                crate::experimental::scene::shutdown();
-                let context = get_context();
-                if self.0 && !std::thread::panicking() {
-                    context.finish_resource_disposal();
-                } else {
-                    context.abandon_resource_disposal();
+
+        // Finish every cleanup phase even if a user destructor panics. Values
+        // are detached before dropping; no context/scheduler borrow crosses Drop.
+        fn clean(first: &mut Option<Box<dyn std::any::Any + Send>>, f: impl FnOnce()) {
+            if let Err(panic) = std::panic::catch_unwind(AssertUnwindSafe(f)) {
+                if first.is_none() {
+                    *first = Some(panic);
                 }
             }
         }
-        let _shutdown = ShutdownScene(backend_available);
+        let mut first_panic = None;
+        let was_panicking = std::thread::panicking();
+        // Forced backend exit/unwind cannot promise a usable native graphics
+        // context. Remove access and close disposal before dropping user values.
+        let mut detached = if backend_available {
+            None
+        } else {
+            context::take()
+        };
+        if let Some(context) = &detached {
+            context.abandon_resource_disposal();
+        }
+        let coroutines = match &detached {
+            Some(context) => context.coroutines_context.clone(),
+            None => with_context(|context| context.coroutines_context.clone()),
+        };
         let future = std::mem::replace(&mut self.main_future, Box::pin(async {}));
-        drop(future);
+        clean(&mut first_panic, || drop(future));
+        clean(&mut first_panic, || {
+            experimental::scene::shutdown_with(|| coroutines.stop_all());
+        });
+        let (ui, recovery) = match &mut detached {
+            Some(context) => (context.ui_context.take(), context.recovery_handler.take()),
+            None => {
+                with_context(|context| (context.ui_context.take(), context.recovery_handler.take()))
+            }
+        };
+        clean(&mut first_panic, || drop(recovery));
+        clean(&mut first_panic, || drop(ui));
+        // Final cancellation closes the scheduler, including tasks created by
+        // earlier destructors. Insertions from this cancellation are discarded.
+        clean(&mut first_panic, || coroutines.shutdown());
+        clean(&mut first_panic, telemetry::shutdown);
+        let context = detached
+            .or_else(context::take)
+            .expect("session context disappeared");
+        let can_delete = backend_available && first_panic.is_none();
+        clean(&mut first_panic, || context.destroy(can_delete));
+        if !was_panicking {
+            if let Some(panic) = first_panic {
+                std::panic::resume_unwind(panic);
+            }
+        }
     }
 }
 
 impl Drop for Stage {
     fn drop(&mut self) {
-        // Fallback for unwinding or backend exit without a quit event. Backend
-        // availability on this path is platform-dependent; normal exits clean
-        // up explicitly before reaching here.
+        // Native window availability on this fallback is platform-dependent.
+        // Only normal completion/accepted quit perform GPU disposal explicitly.
         self.shutdown(false);
     }
 }
 
 impl EventHandler for Stage {
     fn resize_event(&mut self, width: f32, height: f32) {
+        if self.resources_closed {
+            return;
+        }
         let _z = telemetry::ZoneGuard::new("Event::resize_event");
-        get_context().screen_width = width;
-        get_context().screen_height = height;
+        with_context(|context| {
+            context.screen_width = width;
+            context.screen_height = height;
+        });
 
         if miniquad::window::blocking_event_loop() {
             miniquad::window::schedule_update();
@@ -630,217 +623,253 @@ impl EventHandler for Stage {
     }
 
     fn raw_mouse_motion(&mut self, x: f32, y: f32) {
-        let context = get_context();
-
-        if context.cursor_grabbed {
-            context.mouse_position += Vec2::new(x, y);
-
-            let event = MiniquadInputEvent::MouseMotion {
-                x: context.mouse_position.x,
-                y: context.mouse_position.y,
-            };
-            context
-                .input_events
-                .iter_mut()
-                .for_each(|arr| arr.push(event.clone()));
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            if context.cursor_grabbed {
+                context.mouse_position += Vec2::new(x, y);
+
+                let event = MiniquadInputEvent::MouseMotion {
+                    x: context.mouse_position.x,
+                    y: context.mouse_position.y,
+                };
+                context
+                    .input_events
+                    .iter_mut()
+                    .for_each(|arr| arr.push(event.clone()));
+            }
+        })
     }
 
     fn mouse_motion_event(&mut self, x: f32, y: f32) {
-        let context = get_context();
+        if self.resources_closed {
+            return;
+        }
+        crate::with_context(|context| {
+            if !context.cursor_grabbed {
+                context.mouse_position = Vec2::new(x, y);
 
-        if !context.cursor_grabbed {
-            context.mouse_position = Vec2::new(x, y);
+                context
+                    .input_events
+                    .iter_mut()
+                    .for_each(|arr| arr.push(MiniquadInputEvent::MouseMotion { x, y }));
+            }
+
+            if context.update_on.mouse_motion {
+                miniquad::window::schedule_update();
+            }
+        })
+    }
+
+    fn mouse_wheel_event(&mut self, x: f32, y: f32) {
+        if self.resources_closed {
+            return;
+        }
+        crate::with_context(|context| {
+            context.mouse_wheel.x += x;
+            context.mouse_wheel.y += y;
 
             context
                 .input_events
                 .iter_mut()
-                .for_each(|arr| arr.push(MiniquadInputEvent::MouseMotion { x, y }));
-        }
+                .for_each(|arr| arr.push(MiniquadInputEvent::MouseWheel { x, y }));
 
-        if context.update_on.mouse_motion {
-            miniquad::window::schedule_update();
-        }
-    }
-
-    fn mouse_wheel_event(&mut self, x: f32, y: f32) {
-        let context = get_context();
-
-        context.mouse_wheel.x += x;
-        context.mouse_wheel.y += y;
-
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::MouseWheel { x, y }));
-
-        if context.update_on.mouse_wheel {
-            miniquad::window::schedule_update();
-        }
+            if context.update_on.mouse_wheel {
+                miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn mouse_button_down_event(&mut self, btn: MouseButton, x: f32, y: f32) {
-        let context = get_context();
-
-        context.mouse_down.insert(btn);
-        context.mouse_pressed.insert(btn);
-
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonDown { x, y, btn }));
-
-        if !context.cursor_grabbed {
-            context.mouse_position = Vec2::new(x, y);
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            context.mouse_down.insert(btn);
+            context.mouse_pressed.insert(btn);
 
-        if context.update_on.mouse_down {
-            miniquad::window::schedule_update();
-        }
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonDown { x, y, btn }));
+
+            if !context.cursor_grabbed {
+                context.mouse_position = Vec2::new(x, y);
+            }
+
+            if context.update_on.mouse_down {
+                miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn mouse_button_up_event(&mut self, btn: MouseButton, x: f32, y: f32) {
-        let context = get_context();
-        //     println!("btn = {}", btn as u32);
-        context.mouse_down.remove(&btn);
-        context.mouse_released.insert(btn);
-
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
-
-        if !context.cursor_grabbed {
-            context.mouse_position = Vec2::new(x, y);
+        if self.resources_closed {
+            return;
         }
-        if context.update_on.mouse_up {
-            miniquad::window::schedule_update();
-        }
+        crate::with_context(|context| {
+            //     println!("btn = {}", btn as u32);
+            context.mouse_down.remove(&btn);
+            context.mouse_released.insert(btn);
+
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
+
+            if !context.cursor_grabbed {
+                context.mouse_position = Vec2::new(x, y);
+            }
+            if context.update_on.mouse_up {
+                miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn mouse_leave_event(&mut self) {
-        let context = get_context();
-        context.mouse_released.extend(context.mouse_down.drain());
+        if self.resources_closed {
+            return;
+        }
+        crate::with_context(|context| {
+            context.mouse_released.extend(context.mouse_down.drain());
+        })
     }
 
     fn mouse_enter_event(&mut self, btn: MouseButton, x: f32, y: f32) {
-        let context = get_context();
-
-        if !context.cursor_grabbed {
-            context.mouse_position = Vec2::new(x, y);
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            if !context.cursor_grabbed {
+                context.mouse_position = Vec2::new(x, y);
+            }
 
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
-        if btn != MouseButton::Unknown {
-            context.mouse_down.insert(btn);
-            context.mouse_pressed.insert(btn);
-        }
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::MouseButtonUp { x, y, btn }));
+            if btn != MouseButton::Unknown {
+                context.mouse_down.insert(btn);
+                context.mouse_pressed.insert(btn);
+            }
 
-        if context.update_on.mouse_up {
-            miniquad::window::schedule_update();
-        }
+            if context.update_on.mouse_up {
+                miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn touch_event(&mut self, phase: TouchPhase, id: u64, x: f32, y: f32) {
-        let context = get_context();
-
-        context.touches.insert(
-            id,
-            input::Touch {
-                id,
-                phase: phase.into(),
-                position: Vec2::new(x, y),
-            },
-        );
-
-        if context.simulate_mouse_with_touch {
-            if phase == TouchPhase::Started {
-                self.mouse_button_down_event(MouseButton::Left, x, y);
-            }
-
-            if phase == TouchPhase::Ended {
-                self.mouse_button_up_event(MouseButton::Left, x, y);
-            }
-
-            if phase == TouchPhase::Moved {
-                self.mouse_motion_event(x, y);
-            }
-        } else if context.update_on.touch {
-            miniquad::window::schedule_update();
-        };
-
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::Touch { phase, id, x, y }));
-
-        if context.update_on.mouse_down {
-            miniquad::window::schedule_update();
+        if self.resources_closed {
+            return;
         }
-    }
-
-    fn char_event(&mut self, character: char, modifiers: KeyMods, repeat: bool) {
-        let context = get_context();
-
-        context.chars_pressed_queue.push_back(character);
-        context.chars_pressed_ui_queue.push_back(character);
-
-        context.input_events.iter_mut().for_each(|arr| {
-            arr.push(MiniquadInputEvent::Char {
-                character,
-                modifiers,
-                repeat,
-            });
+        let simulate_mouse = with_context(|context| {
+            context.touches.insert(
+                id,
+                input::Touch {
+                    id,
+                    phase: phase.into(),
+                    position: Vec2::new(x, y),
+                },
+            );
+            context.simulate_mouse_with_touch
         });
+        // Mouse dispatch reacquires input state; release the touch borrow first.
+        if simulate_mouse {
+            match phase {
+                TouchPhase::Started => self.mouse_button_down_event(MouseButton::Left, x, y),
+                TouchPhase::Ended => self.mouse_button_up_event(MouseButton::Left, x, y),
+                TouchPhase::Moved => self.mouse_motion_event(x, y),
+                _ => {}
+            }
+        }
+        with_context(|context| {
+            if !simulate_mouse && context.update_on.touch {
+                miniquad::window::schedule_update();
+            }
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::Touch { phase, id, x, y }));
+            if context.update_on.mouse_down {
+                miniquad::window::schedule_update();
+            }
+        });
+    }
+    fn char_event(&mut self, character: char, modifiers: KeyMods, repeat: bool) {
+        if self.resources_closed {
+            return;
+        }
+        crate::with_context(|context| {
+            context.chars_pressed_queue.push_back(character);
+            context.chars_pressed_ui_queue.push_back(character);
+
+            context.input_events.iter_mut().for_each(|arr| {
+                arr.push(MiniquadInputEvent::Char {
+                    character,
+                    modifiers,
+                    repeat,
+                });
+            });
+        })
     }
 
     fn key_down_event(&mut self, keycode: KeyCode, modifiers: KeyMods, repeat: bool) {
-        let context = get_context();
-        context.keys_down.insert(keycode);
-        if repeat == false {
-            context.keys_pressed.insert(keycode);
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            context.keys_down.insert(keycode);
+            if repeat == false {
+                context.keys_pressed.insert(keycode);
+            }
 
-        context.input_events.iter_mut().for_each(|arr| {
-            arr.push(MiniquadInputEvent::KeyDown {
-                keycode,
-                modifiers,
-                repeat,
+            context.input_events.iter_mut().for_each(|arr| {
+                arr.push(MiniquadInputEvent::KeyDown {
+                    keycode,
+                    modifiers,
+                    repeat,
+                });
             });
-        });
-        if context
-            .update_on
-            .specific_key
-            .as_ref()
-            .map_or(context.update_on.key_down, |keys| keys.contains(&keycode))
-        {
-            miniquad::window::schedule_update();
-        }
+            if context
+                .update_on
+                .specific_key
+                .as_ref()
+                .map_or(context.update_on.key_down, |keys| keys.contains(&keycode))
+            {
+                miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn key_up_event(&mut self, keycode: KeyCode, modifiers: KeyMods) {
-        let context = get_context();
-        context.keys_down.remove(&keycode);
-        context.keys_released.insert(keycode);
-
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::KeyUp { keycode, modifiers }));
-
-        if miniquad::window::blocking_event_loop() {
-            //miniquad::window::schedule_update();
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            context.keys_down.remove(&keycode);
+            context.keys_released.insert(keycode);
+
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::KeyUp { keycode, modifiers }));
+
+            if miniquad::window::blocking_event_loop() {
+                //miniquad::window::schedule_update();
+            }
+        })
     }
 
     fn update(&mut self) {
+        if self.resources_closed {
+            return;
+        }
         let _z = telemetry::ZoneGuard::new("Event::update");
 
         // Unless called every frame, cursor will not remain grabbed
-        miniquad::window::set_cursor_grab(get_context().cursor_grabbed);
+        miniquad::window::set_cursor_grab(with_context(|context| context.cursor_grabbed));
 
         #[cfg(not(target_arch = "wasm32"))]
         {
@@ -850,16 +879,24 @@ impl EventHandler for Stage {
     }
 
     fn files_dropped_event(&mut self) {
-        let context = get_context();
-        for i in 0..miniquad::window::dropped_file_count() {
-            context.dropped_files.push(DroppedFile {
-                path: miniquad::window::dropped_file_path(i),
-                bytes: miniquad::window::dropped_file_bytes(i),
-            });
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            for i in 0..miniquad::window::dropped_file_count() {
+                context.dropped_files.push(DroppedFile {
+                    path: miniquad::window::dropped_file_path(i),
+                    bytes: miniquad::window::dropped_file_bytes(i),
+                });
+            }
+        })
     }
 
     fn draw(&mut self) {
+        if self.resources_closed {
+            return;
+        }
+        let mut completed = false;
         {
             let _z = telemetry::ZoneGuard::new("Event::draw");
 
@@ -868,14 +905,23 @@ impl EventHandler for Stage {
             {
                 let _z = telemetry::ZoneGuard::new("Event::draw begin_frame");
                 let (ui, input) = {
-                    let context = get_context();
-                    (
-                        context.ui_context.ui.clone(),
-                        ui::ui_context::InputSnapshot::take(context, miniquad::window::dpi_scale()),
-                    )
+                    crate::with_context(|context| {
+                        (
+                            context
+                                .ui_context
+                                .as_ref()
+                                .expect("UI has shut down")
+                                .ui
+                                .clone(),
+                            ui::ui_context::InputSnapshot::take(
+                                context,
+                                miniquad::window::dpi_scale(),
+                            ),
+                        )
+                    })
                 };
                 UiContext::process_input(&ui, input);
-                get_context().begin_frame();
+                with_context(Context::begin_frame);
             }
 
             fn maybe_unwind(unwind: bool, f: impl FnOnce() + Sized + panic::UnwindSafe) -> bool {
@@ -887,19 +933,20 @@ impl EventHandler for Stage {
                 }
             }
 
-            let mut completed = false;
             let result = maybe_unwind(
-                get_context().unwind,
+                with_context(|context| context.unwind),
                 AssertUnwindSafe(|| {
                     let _z = telemetry::ZoneGuard::new("Event::draw user code");
 
                     if exec::resume(&mut self.main_future).is_some() {
                         self.main_future = Box::pin(async move {});
+                        crate::experimental::scene::shutdown();
+                        with_context(|context| context.gl.reset());
                         completed = true;
                         miniquad::window::quit();
                         return;
                     }
-                    let coroutines = get_context().coroutines_context.clone();
+                    let coroutines = with_context(|context| context.coroutines_context.clone());
                     coroutines.update();
                     // Scene callbacks may use timing, cameras, and drawing APIs.
                     // Dispatch outside Context::end_frame's exclusive borrow and
@@ -916,26 +963,25 @@ impl EventHandler for Stage {
 
             {
                 let _z = telemetry::ZoneGuard::new("Event::draw end_frame");
-                get_context().end_frame();
+                with_context(Context::end_frame);
             }
             #[cfg(one_screenshot)]
             {
                 let capture = {
-                    let context = get_context();
-                    context.counter += 1;
-                    context.counter == 3
+                    crate::with_context(|context| {
+                        context.counter += 1;
+                        context.counter == 3
+                    })
                 };
                 if capture {
                     crate::prelude::get_screen_data().export_png("screenshot.png");
                     panic!("screenshot successfully saved to `screenshot.png`");
                 }
             }
-            if completed {
-                get_context().finish_resource_disposal();
-                self.resources_closed = true;
-            }
-            get_context().frame_time = date::now() - get_context().last_frame_time;
-            get_context().last_frame_time = date::now();
+            with_context(|context| {
+                context.frame_time = date::now() - context.last_frame_time;
+                context.last_frame_time = date::now();
+            });
 
             // glFinish waits until the drawing is done. See https://registry.khronos.org/OpenGL-Refpages/gl4/html/glFinish.xhtml.
             // Some drivers do this by a busy loop which increases CPU usage to close to 100%.
@@ -956,49 +1002,61 @@ impl EventHandler for Stage {
         }
 
         telemetry::reset();
+        if completed {
+            self.shutdown(true);
+        }
     }
 
     fn window_restored_event(&mut self) {
-        let context = get_context();
-
-        #[cfg(target_os = "android")]
-        context.audio_context.resume();
-        #[cfg(target_os = "android")]
-        if miniquad::window::blocking_event_loop() {
-            miniquad::window::schedule_update();
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            #[cfg(target_os = "android")]
+            context.audio_context.resume();
+            #[cfg(target_os = "android")]
+            if miniquad::window::blocking_event_loop() {
+                miniquad::window::schedule_update();
+            }
 
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::WindowRestored));
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::WindowRestored));
+        })
     }
 
     fn window_minimized_event(&mut self) {
-        let context = get_context();
-
-        #[cfg(target_os = "android")]
-        context.audio_context.pause();
-
-        // Clear held down keys and button and announce them as released
-        context.mouse_released.extend(context.mouse_down.drain());
-        context.keys_released.extend(context.keys_down.drain());
-
-        // Announce all touches as released
-        for (_, touch) in context.touches.iter_mut() {
-            touch.phase = input::TouchPhase::Ended;
+        if self.resources_closed {
+            return;
         }
+        crate::with_context(|context| {
+            #[cfg(target_os = "android")]
+            context.audio_context.pause();
 
-        context
-            .input_events
-            .iter_mut()
-            .for_each(|arr| arr.push(MiniquadInputEvent::WindowMinimized));
+            // Clear held down keys and button and announce them as released
+            context.mouse_released.extend(context.mouse_down.drain());
+            context.keys_released.extend(context.keys_down.drain());
+
+            // Announce all touches as released
+            for (_, touch) in context.touches.iter_mut() {
+                touch.phase = input::TouchPhase::Ended;
+            }
+
+            context
+                .input_events
+                .iter_mut()
+                .for_each(|arr| arr.push(MiniquadInputEvent::WindowMinimized));
+        })
     }
 
     fn quit_requested_event(&mut self) {
-        if get_context().prevent_quit_event {
+        if self.resources_closed {
+            return;
+        }
+        if with_context(|context| context.prevent_quit_event) {
             miniquad::window::cancel_quit();
-            get_context().quit_requested = true;
+            with_context(|context| context.quit_requested = true);
         } else {
             self.shutdown(true);
         }
@@ -1084,7 +1142,7 @@ impl Window {
     }
 
     pub fn from_config(config: impl Into<conf::Conf>, future: impl Future<Output = ()> + 'static) {
-        window::assert_context_available();
+        let reservation = thread_assert::WindowReservation::new();
         let conf::Conf {
             miniquad_conf,
             update_on,
@@ -1093,28 +1151,24 @@ impl Window {
             draw_call_index_capacity,
         } = config.into();
         miniquad::start(miniquad_conf, move || {
-            thread_assert::set_thread_id();
+            let owner = thread_assert::set_thread_id();
             let context = Context::new(
                 update_on.unwrap_or_default(),
                 default_filter_mode,
                 draw_call_vertex_capacity,
                 draw_call_index_capacity,
             );
-            unsafe { CONTEXT = Some(context) };
-            crate::experimental::scene::initialize(crate::time::get_time());
-
-            Box::new(Stage {
+            context::install(context);
+            let stage = Stage {
                 resources_closed: false,
-                main_future: Box::pin(async {
-                    future.await;
-                    crate::experimental::scene::shutdown();
-                    unsafe {
-                        if let Some(ctx) = CONTEXT.as_mut() {
-                            ctx.gl.reset();
-                        }
-                    }
-                }),
-            })
+                main_future: Box::pin(future),
+                _owner: owner,
+                _reservation: reservation,
+            };
+            // The stage also rolls back the installed context if initialization
+            // unwinds before the backend receives its event handler.
+            crate::experimental::scene::initialize(crate::time::get_time());
+            Box::new(stage)
         });
     }
 }

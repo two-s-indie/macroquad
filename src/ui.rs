@@ -49,7 +49,14 @@ use std::{
 /// This preserves CPU storage, not permission to use old GPU resources with a
 /// different session. Like other UI values, the guard stays on its owner thread.
 pub fn root_ui() -> impl DerefMut<Target = Ui> {
-    let ui = crate::get_context().ui_context.ui.clone();
+    let ui = crate::with_context(|context| {
+        context
+            .ui_context
+            .as_ref()
+            .expect("root UI has shut down")
+            .ui
+            .clone()
+    });
     ui.borrow_mut()
 }
 
@@ -660,13 +667,14 @@ impl Ui {
     /// Creates a separate UI using the active session's backend and disposal
     /// queue. Inside `with_internal_gl`, use `gl.new_ui(width, height)` instead.
     pub fn new(screen_width: f32, screen_height: f32) -> Ui {
-        let context = crate::get_context();
-        Self::new_with_disposal(
-            &mut *context.quad_context,
-            screen_width,
-            screen_height,
-            context.textures.disposal(),
-        )
+        crate::with_context(|context| {
+            Self::new_with_disposal(
+                &mut *context.quad_context,
+                screen_width,
+                screen_height,
+                context.textures.disposal(),
+            )
+        })
     }
 
     pub(crate) fn new_with_disposal(

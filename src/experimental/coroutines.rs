@@ -10,7 +10,6 @@ use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::exec::resume;
-use crate::get_context;
 
 mod generational_storage;
 #[cfg(test)]
@@ -38,13 +37,14 @@ struct Scheduler {
     coroutines: GenerationalStorage<CoroutineState>,
     active_delta: Option<f64>,
     updating: bool,
+    closed: bool,
 }
 
 #[derive(Clone)]
 pub(crate) struct CoroutinesContext(Rc<RefCell<Scheduler>>);
 
 fn context() -> CoroutinesContext {
-    get_context().coroutines_context.clone()
+    crate::with_context(|context| context.coroutines_context.clone())
 }
 
 impl CoroutinesContext {
@@ -53,10 +53,19 @@ impl CoroutinesContext {
             coroutines: GenerationalStorage::new(),
             active_delta: None,
             updating: false,
+            closed: false,
         })))
     }
 
     fn start<T: 'static + Any>(&self, future: impl Future<Output = T> + 'static) -> Coroutine<T> {
+        if self.0.borrow().closed {
+            // Drop captured user values after releasing the scheduler borrow.
+            drop(future);
+            return Coroutine {
+                id: GenerationalId::cancelled(),
+                _phantom: PhantomData,
+            };
+        }
         let coroutine = CoroutineState::Running(CoroutineInternal {
             future: Box::pin(async { Box::new(future.await) as _ }),
             has_value: TypeId::of::<()>() != TypeId::of::<T>(),
@@ -193,8 +202,17 @@ impl CoroutinesContext {
         drop(removed);
     }
 
-    fn stop_all(&self) {
+    pub(crate) fn stop_all(&self) {
         let removed = self.0.borrow_mut().coroutines.take_all();
+        drop(removed);
+    }
+
+    pub(crate) fn shutdown(&self) {
+        let removed = {
+            let mut scheduler = self.0.borrow_mut();
+            scheduler.closed = true;
+            scheduler.coroutines.take_all()
+        };
         drop(removed);
     }
 

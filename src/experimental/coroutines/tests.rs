@@ -12,6 +12,30 @@ impl Drop for OnDrop {
 }
 
 #[test]
+fn shutdown_cancels_destructor_insertions_outside_scheduler_borrows() {
+    let scheduler = CoroutinesContext::new();
+    let drops = Rc::new(Cell::new(0));
+    let (ctx, count) = (scheduler.clone(), drops.clone());
+    let token = OnDrop(Some(Box::new(move || {
+        count.set(count.get() + 1);
+        let inner = OnDrop(Some(Box::new(move || count.set(count.get() + 1))));
+        let cancelled = ctx.start(async move {
+            let _inner = inner;
+        });
+        assert!(ctx.is_done(cancelled.id));
+    })));
+    let old = scheduler.start(async move {
+        let _token = token;
+        std::future::pending::<()>().await;
+    });
+    scheduler.shutdown();
+    assert_eq!(drops.get(), 2);
+    assert!(scheduler.is_done(old.id));
+    assert_eq!(scheduler.active_coroutines_count(), 0);
+    scheduler.shutdown();
+}
+
+#[test]
 fn snapshot_defers_insertions_and_rejects_reused_slots() {
     let scheduler = CoroutinesContext::new();
     let victim = Rc::new(Cell::new(None::<GenerationalId>));

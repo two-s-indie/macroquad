@@ -11,10 +11,7 @@ fn rejects_context_access(f: impl FnOnce()) {
         .map(String::as_str)
         .or_else(|| panic.downcast_ref::<&str>().copied())
         .unwrap();
-    assert!(
-        message.contains("already borrowed by with_internal_gl"),
-        "{message}"
-    );
+    assert!(message.contains("context is already borrowed"), "{message}");
 }
 
 // One window per process, exercising the guards against an actual backend.
@@ -72,7 +69,7 @@ async fn ui_and_gl_access_have_owned_or_scoped_lifetimes() {
         rejects_context_access(|| {
             root_ui();
         });
-        rejects_context_access(|| macroquad::Window::new("nested window", async {}));
+        assert!(catch_unwind(|| macroquad::Window::new("nested window", async {})).is_err());
         // Failed nested calls must not release the outer scope or damage it.
         assert_eq!(gl.texture_id(&texture), expected_id);
         gl.flush();

@@ -4,10 +4,10 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 7 are complete. `SCENE` now uses scoped thread-local storage;
-its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
-The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
-The overall engine/context migration is not yet complete.
+Steps 1 through 8 are complete. `SCENE` and `CONTEXT` now use scoped thread-local
+storage; their `static_mut_refs` warnings are gone. The `THREAD_ID`, `STORAGE`,
+and `PROFILER` changes are also implemented. Step 9 remains for final migration
+verification, including representative game runtime and performance checks.
 
 ## Working rules
 
@@ -394,23 +394,78 @@ Metal, Miri, and full game runtime/performance validation were not run.
 
 ### 8 Replace CONTEXT storage and define its lifecycle
 
-- [ ] Select the final grouping from the access patterns established above:
+- [x] Select the final grouping from the access patterns established above:
   scoped `RefCell` access for independently borrowed subsystems, and explicit
   borrowing of multiple fields for operations that need them together.
-- [ ] Replace `static mut CONTEXT`, unrestricted `&'static mut` getters, direct
+- [x] Replace `static mut CONTEXT`, unrestricted `&'static mut` getters, direct
   initialization, and completion cleanup with the new scoped API.
-- [ ] Retain main-thread validation and deliberate support for sequential
+- [x] Retain main-thread validation and deliberate support for sequential
   window/test initialization. Do not make the rendering context freely
   accessible from arbitrary threads.
-- [ ] Shut down explicitly while the graphics backend remains valid. Release
+- [x] Shut down explicitly while the graphics backend remains valid. Release
   user futures, scene/UI resources, disposal queues, and backend resources in a
   tested order instead of relying on thread-local destructor order.
-- [ ] Check whether the current `#[no_mangle] CONTEXT` symbol has any external
+- [x] Check whether the current `#[no_mangle] CONTEXT` symbol has any external
   consumers before removing or changing its representation.
 
 Acceptance: the four `CONTEXT` warnings are gone without suppressing them;
 there are no unrestricted context/backend getters returning `&'static mut`.
 Initialization, normal frames, panic recovery, and shutdown tests pass.
+
+Outcome: a private `RefCell<Option<Context>>` owns the active session. Scoped
+closures borrow renderer/backend/texture state together; independently owned UI
+and coroutine state is cloned out before user code runs. Every former context
+and backend getter now uses this boundary. No unrestricted context reference,
+mutable context global, or warning suppression remains. The temporary step 7
+GL flag is replaced by the actual checked borrow. Screenshots release their
+initial borrow before readback, touch-to-mouse dispatch releases input state
+before redispatch, cube faces use the already-borrowed renderer, and generic
+material uniform values drop outside the borrow.
+
+Window startup reserves the single active session before calling Miniquad,
+then registers the actual backend thread. Overlapping/reentrant starts fail
+before backend initialization. RAII releases ownership after teardown; headless
+tests verify repeated slots and registration on a later thread. Miniquad's
+native display still cannot reopen in the same process, so native lifecycle
+scenarios run in separate processes. Searches of this repository and the sibling
+Miniquad, quad-snd, and game sources found no consumers of the exported `CONTEXT`
+symbol; it is removed without an ABI compatibility shim.
+
+Normal completion and accepted quit drop the main future, cancel coroutines,
+detach the scene, and release recovery/UI user data while the context remains
+installed. Each user destruction phase runs outside context/scheduler borrows.
+Final scheduler closure also cancels tasks created by earlier destructors;
+further insertions are immediately cancelled. Teardown continues through its
+remaining phases if a user destructor panics, then propagates the first panic.
+The context is removed, engine-owned resources enqueue disposal, queues drain
+and close, and the backend owner drops last. Late OS callbacks are ignored.
+
+Forced backend exits and uncaught unwind cannot guarantee a usable native
+graphics context: they remove context access and close disposal queues before
+dropping user state, without issuing explicit GPU deletions. Native graphics
+teardown owns remaining allocations, including profiler capture/query objects.
+Profiler state resets so raw query/capture IDs cannot leak into another session.
+UI guards can retain CPU storage after teardown; this does not extend backend
+availability. An already detached root UI cannot be reacquired during its Drop.
+
+Sound destruction now queues deletion at frame/final cleanup, with harmless
+late drops after shutdown. Coroutine handles carry storage identity; material,
+sound, render-pass, and atlas operations validate their originating session.
+Raw/unmanaged backend IDs remain caller-managed. Ordinary public API signatures
+are unchanged; the step 7 low-level migration remains the compatibility change.
+
+Validation: 84 library tests and three scoped-GL documentation checks pass.
+Native lifecycle tests cover completion, accepted quit, uncaught main-future
+panic, and a UI destructor panic, including resource access from destructors,
+tasks spawned during teardown, exact-once drops, and late cross-thread release.
+They also pass with real audio enabled (no playback). Nine graphics/coroutine
+regression binaries, five separately executed coroutine timing/value cases,
+and the `one_screenshot` diagnostic pass on Windows/OpenGL. A cube pixel
+regression reproduces and fixes nested renderer access. Native build,
+all-target/all-feature checking, all-feature WebAssembly library checking,
+formatting, and whitespace checks pass with no Rust warnings. Metal, a browser
+WASM runtime, other native platforms, Miri, and the full game/performance check
+were not run; step 9 remains open.
 
 ### 9 Verify the complete migration
 
@@ -439,9 +494,8 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next implementation task is step 8: replace `CONTEXT` and its unrestricted
-accessors, then define and verify full session teardown. Four context warnings
-remain until that migration is complete.
+The next task is step 9: verify the complete migration, including representative
+game behavior and performance. No `SCENE` or `CONTEXT` warnings remain.
 
 ## Rust reference guidance
 
