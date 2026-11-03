@@ -144,6 +144,14 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Documentation
 
+- Complete step 9 of the scene/context plan and add
+  `SCENE-CONTEXT-VALIDATION.md`. Native/all-feature and WebAssembly checks are
+  free of Rust compiler warnings; ownership, graphics, coroutine, audio,
+  screenshot, and Windows DPI regressions pass. Add repeatable baseline/game
+  benchmark tooling and per-run measurements: matching pixels, unchanged Rust
+  allocations, and no median timing regression in the current game prototype
+  and drawing/input stress case. Record timing variability, unavailable Miri,
+  and untested platforms/full gameplay; no further production changes needed.
 - Complete step 1 of the scene/context plan and add `SCENE-OWNERSHIP-AUDIT.md`
   with behavior, pointer hazards, clear/delete requirements, and the proposed
   owned-guard and scene/session handle strategy.

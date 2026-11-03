@@ -4,10 +4,11 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 8 are complete. `SCENE` and `CONTEXT` now use scoped thread-local
+Steps 1 through 9 are complete. `SCENE` and `CONTEXT` now use scoped thread-local
 storage; their `static_mut_refs` warnings are gone. The `THREAD_ID`, `STORAGE`,
-and `PROFILER` changes are also implemented. Step 9 remains for final migration
-verification, including representative game runtime and performance checks.
+and `PROFILER` changes are also implemented. Final checks, the current game
+prototype comparison, and coverage limits are recorded in
+[SCENE-CONTEXT-VALIDATION.md](SCENE-CONTEXT-VALIDATION.md).
 
 ## Working rules
 
@@ -469,22 +470,47 @@ were not run; step 9 remains open.
 
 ### 9 Verify the complete migration
 
-- [ ] Run `cargo build` and confirm no `static_mut_refs` warnings remain in the
+- [x] Run `cargo build` and confirm no `static_mut_refs` warnings remain in the
   main library. Report unrelated warnings separately rather than hiding them.
-- [ ] Run the library tests, relevant graphics integration tests, and checks for
+- [x] Run the library tests, relevant graphics integration tests, and checks for
   all targets/features on Windows and `wasm32-unknown-unknown`.
-- [ ] Exercise nested UI, scene callbacks, coroutines, material changes,
+- [x] Exercise nested UI, scene callbacks, coroutines, material changes,
   render-target disposal, telemetry capture, and screenshot mode in actual
   rendering runs. Compilation alone is insufficient for these paths.
-- [ ] Use Miri on isolated ownership/borrowing tests where supported; keep GPU
+- [x] Use Miri on isolated ownership/borrowing tests where supported; keep GPU
   calls outside those tests. If unavailable, record that limitation rather than
   claiming aliasing validation from ordinary test success.
-- [ ] Run a representative game scene and compare frame time/allocation behavior
+- [x] Run a representative game scene and compare frame time/allocation behavior
   with the baseline. Investigate regressions in hot drawing/input paths before
   adding unchecked fast paths.
 
 Acceptance: documented checks pass, the game-facing compatibility decisions
 are resolved, and the changelog describes the final behavior and any limitations.
+
+Outcome: native build and all-target/all-feature checks pass on Windows and
+WebAssembly without Rust compiler warnings. All 84 library tests and 17 doc
+checks pass (three existing doc examples remain intentionally ignored). Twelve
+native integration binaries pass with all features, along with five separately
+run coroutine cases, screenshot mode, and all four Windows DPI scenarios.
+These execute the migrated UI, scene, coroutine, material/disposal, telemetry,
+panic, and shutdown paths against Windows/OpenGL.
+
+Compared the sibling game's actual DPI/input prototype at `cfa37bd` and a
+2,000-rectangle/input stress workload against pre-migration `53e0ac7` using
+isolated release builds with identical dependencies. Five runs per version and
+workload, each with 1,000 warmup and 5,000 measured frames, show matching pixels,
+unchanged Rust allocation rates, and zero retained-byte growth. Median CPU/frame
+times do not regress; stress p95 varies by about 3–4%, so no general speedup is
+claimed. Repeated longer runs investigated the short pilot's timing variation.
+No production optimization or unchecked access was needed. Added repeatable
+benchmark scripts and preserved per-run results.
+
+Miri is not installed in the available nightly toolchain; this is the explicitly
+allowed limitation for that checklist item. WebAssembly was compiled, not run
+in a browser. Metal/other native platforms and an asset-rich gameplay scene
+remain untested; the current sibling game has no such scene. Full commands,
+measurement details, compatibility decisions, and limits are in the
+[validation report](SCENE-CONTEXT-VALIDATION.md).
 
 ## Verification for each step
 
@@ -494,8 +520,8 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next task is step 9: verify the complete migration, including representative
-game behavior and performance. No `SCENE` or `CONTEXT` warnings remain.
+The planned migration is complete. No `SCENE` or `CONTEXT` warnings remain;
+future platform and gameplay coverage can extend the recorded validation.
 
 ## Rust reference guidance
 
