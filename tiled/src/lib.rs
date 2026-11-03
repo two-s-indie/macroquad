@@ -261,7 +261,7 @@ impl Map {
         );
     }
 
-    pub fn tiles(&self, layer: &str, rect: impl Into<Option<Rect>>) -> TilesIterator {
+    pub fn tiles(&self, layer: &str, rect: impl Into<Option<Rect>>) -> TilesIterator<'_> {
         assert!(self.layers.contains_key(layer), "No such layer: {}", layer);
 
         let rect = rect.into().unwrap_or(Rect::new(

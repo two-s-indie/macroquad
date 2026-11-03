@@ -4,7 +4,7 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 4 are complete. `SCENE` now uses scoped thread-local storage;
+Steps 1 through 5 are complete. `SCENE` now uses scoped thread-local storage;
 its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
 The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
 The overall engine/context migration is not yet complete.
@@ -206,20 +206,56 @@ lifetime warning. Graphics tests ran on Windows; Metal was not executed.
 
 ### 5 Move resource disposal into independent queues
 
-- [ ] Give texture, render-pass, and material guards access to a narrowly owned
+- [x] Give texture, render-pass, and material guards access to a narrowly owned
   disposal queue rather than requiring the whole context in `Drop`.
-- [ ] Drain queues at defined frame boundaries while borrowing the renderer and
+- [x] Drain queues at defined frame boundaries while borrowing the renderer and
   backend explicitly. Preserve queued-draw lifetimes and attachment deletion order.
-- [ ] Associate queues with their originating engine session so late resource
+- [x] Associate queues with their originating engine session so late resource
   drops cannot delete resources belonging to a newer context.
-- [ ] Define behavior after shutdown. Resource destructors must not attempt to
+- [x] Define behavior after shutdown. Resource destructors must not attempt to
   access an already-destroyed thread-local context or unavailable graphics backend.
-- [ ] Preserve currently supported resource thread-affinity behavior; do not
+- [x] Preserve currently supported resource thread-affinity behavior; do not
   make graphics operations cross-thread as a side effect of queue changes.
 
 Acceptance: existing material/texture/render-target tests pass, including
 dropping resources before queued draws finish. Add targeted checks for nested
 destruction, exact-once disposal, and shutdown/session boundaries.
+
+Outcome: weak disposal senders replace global access in texture, render-pass,
+material, and font-atlas destructors. Each registry/renderer owns its queue;
+queue identity also prevents old managed/weak texture handles from resolving
+new-session slots. Queue locks are released before processing or dropping
+requests. Live resource drops still require the owner thread; expired/closed
+queues ignore late drops without context, TLS, or backend access.
+
+Material requests retire before subsequent geometry, at pipeline allocation,
+and after a render flush. This preserves default-material restoration and
+same-frame slot reuse while keeping queued pipelines alive. Texture and atlas
+requests drain after frame rendering/commit; passes are deleted before textures,
+with attachment ownership unchanged for OpenGL/Metal. Atlas replacement and
+destruction defer deletion so queued glyphs can finish rendering.
+
+Normal completion drains and closes queues after the final frame. Accepted quit
+discards unfinished draws and drains after user/scene cleanup. Forced-exit and
+unwind fallbacks close without issuing GPU deletions. Queue-owner destruction
+also closes the queue. Resources still live at shutdown rely on backend teardown;
+full context/UI ownership and teardown remain steps 7/8. These changes permit
+late destruction, not use of old resource handles with a new engine session.
+Public signatures remain unchanged. The legacy `Ui::new` wrapper obtains the
+active session's disposal sender; internal UI construction receives it explicitly.
+Its backend must belong to the active Macroquad session, as documented. No
+`Ui::new` calls were found in the sibling game.
+
+Validation: 66 library tests pass, including new queue reentry, exact-once
+texture queueing, thread-affinity, and session-isolation tests. Real-backend
+material, render-target, and rendering tests pass, including nested material →
+texture → pass disposal and a font dropped before queued text is flushed.
+Scene lifecycle tests verify late texture/pass/material/font drops after normal
+completion and accepted quit, including from another thread. Native build,
+all-target and WebAssembly library checks, formatting, and whitespace checks
+pass. Four `CONTEXT` warnings remain. The accompanying explicit return lifetime
+in `Map::tiles` removes the tiled crate's lifetime warning.
+Graphics ran on Windows/OpenGL; Metal and Miri were not executed.
 
 ### 6 Move callbacks and future polling outside context borrows
 

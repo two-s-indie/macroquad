@@ -63,6 +63,8 @@ async fn rendering_uses_explicit_backend_and_texture_lookup() {
             ..Default::default()
         },
     );
+    // Its atlas must survive until this queued text is rendered.
+    drop(font);
     set_default_camera();
     assert!(target
         .texture

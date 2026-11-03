@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use crate::{
     color::Color,
-    get_context, get_quad_context,
+    get_context,
     math::{vec3, Rect},
     texture::{Image, TextureHandle},
     Error,
@@ -285,16 +285,16 @@ pub async fn load_ttf_font(path: &str) -> Result<Font, Error> {
 /// let font = load_ttf_font_from_bytes(include_bytes!("font.ttf"));
 /// ```
 pub fn load_ttf_font_from_bytes(bytes: &[u8]) -> Result<Font, Error> {
+    let ctx = get_context();
     let atlas = Arc::new(Mutex::new(Atlas::new(
-        get_quad_context(),
+        &mut *ctx.quad_context,
         miniquad::FilterMode::Linear,
+        ctx.textures.disposal(),
     )));
 
     let font = Font::load_from_bytes(atlas.clone(), bytes)?;
 
     font.populate_font_cache(&Font::ascii_character_list(), 15);
-
-    let ctx = get_context();
 
     font.atlas
         .lock()
@@ -625,8 +625,15 @@ pub(crate) struct FontsStorage {
 }
 
 impl FontsStorage {
-    pub(crate) fn new(ctx: &mut dyn miniquad::RenderingBackend) -> FontsStorage {
-        let atlas = Arc::new(Mutex::new(Atlas::new(ctx, miniquad::FilterMode::Linear)));
+    pub(crate) fn new(
+        ctx: &mut dyn miniquad::RenderingBackend,
+        disposal: crate::resource_disposal::DisposalSender<crate::texture::TextureDisposal>,
+    ) -> FontsStorage {
+        let atlas = Arc::new(Mutex::new(Atlas::new(
+            ctx,
+            miniquad::FilterMode::Linear,
+            disposal,
+        )));
 
         let default_font = Font::load_from_bytes(atlas, include_bytes!("ProggyClean.ttf")).unwrap();
         FontsStorage { default_font }

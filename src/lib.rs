@@ -55,6 +55,7 @@ pub mod input;
 pub mod material;
 pub mod math;
 pub mod models;
+mod resource_disposal;
 pub mod shapes;
 pub mod text;
 pub mod texture;
@@ -351,6 +352,7 @@ impl Context {
         let mut ctx: Box<dyn miniquad::RenderingBackend> =
             miniquad::window::new_rendering_backend();
         let (screen_width, screen_height) = miniquad::window::screen_size();
+        let textures = crate::texture::TexturesContext::new();
 
         Context {
             screen_width,
@@ -385,9 +387,9 @@ impl Context {
                 draw_call_index_capacity,
             ),
 
-            ui_context: UiContext::new(&mut *ctx, screen_width, screen_height),
-            fonts_storage: text::FontsStorage::new(&mut *ctx),
-            texture_batcher: texture::Batcher::new(&mut *ctx),
+            ui_context: UiContext::new(&mut *ctx, screen_width, screen_height, textures.disposal()),
+            fonts_storage: text::FontsStorage::new(&mut *ctx, textures.disposal()),
+            texture_batcher: texture::Batcher::new(&mut *ctx, textures.disposal()),
             camera_stack: vec![],
 
             audio_context: audio::AudioContext::new(),
@@ -407,7 +409,7 @@ impl Context {
             quad_context: ctx,
 
             default_filter_mode,
-            textures: crate::texture::TexturesContext::new(),
+            textures,
             update_on,
 
             dropped_files: Vec::new(),
@@ -524,6 +526,21 @@ impl Context {
                 textures.resolve(&texture.texture, white_texture)
             });
     }
+
+    fn finish_resource_disposal(&mut self) {
+        // Discard unfinished draws on exit, then retire materials before their
+        // textures and render-pass attachments. All backend work stays here.
+        self.gl.finish_disposal(&mut *self.quad_context);
+        self.textures.garbage_collect(&mut *self.quad_context);
+        self.textures.close_disposal();
+    }
+
+    fn abandon_resource_disposal(&self) {
+        // Backend availability is unknown on forced exits/unwind. Late drops
+        // must remain CPU-only; native teardown owns remaining GPU resources.
+        self.gl.close_disposal();
+        self.textures.close_disposal();
+    }
 }
 
 #[no_mangle]
@@ -557,19 +574,38 @@ fn get_quad_context() -> &'static mut dyn miniquad::RenderingBackend {
 
 struct Stage {
     main_future: Pin<Box<dyn Future<Output = ()>>>,
+    resources_closed: bool,
 }
 
 impl Stage {
-    fn shutdown(&mut self) {
+    fn shutdown(&mut self, backend_available: bool) {
+        if self.resources_closed {
+            return;
+        }
+        self.resources_closed = true;
         // Normal completion/accepted quit clean up before backend teardown.
         // Also finish scene cleanup if dropping the main future unwinds.
-        struct ShutdownScene;
+        struct CloseDisposals;
+        impl Drop for CloseDisposals {
+            fn drop(&mut self) {
+                get_context().abandon_resource_disposal();
+            }
+        }
+        // Runs even if a user destructor panics during scene shutdown.
+        let _close = CloseDisposals;
+        struct ShutdownScene(bool);
         impl Drop for ShutdownScene {
             fn drop(&mut self) {
                 crate::experimental::scene::shutdown();
+                let context = get_context();
+                if self.0 && !std::thread::panicking() {
+                    context.finish_resource_disposal();
+                } else {
+                    context.abandon_resource_disposal();
+                }
             }
         }
-        let _shutdown = ShutdownScene;
+        let _shutdown = ShutdownScene(backend_available);
         let future = std::mem::replace(&mut self.main_future, Box::pin(async {}));
         drop(future);
     }
@@ -580,7 +616,7 @@ impl Drop for Stage {
         // Fallback for unwinding or backend exit without a quit event. Backend
         // availability on this path is platform-dependent; normal exits clean
         // up explicitly before reaching here.
-        self.shutdown();
+        self.shutdown(false);
     }
 }
 
@@ -845,6 +881,7 @@ impl EventHandler for Stage {
                 }
             }
 
+            let mut completed = false;
             let result = maybe_unwind(
                 get_context().unwind,
                 AssertUnwindSafe(|| {
@@ -852,6 +889,7 @@ impl EventHandler for Stage {
 
                     if exec::resume(&mut self.main_future).is_some() {
                         self.main_future = Box::pin(async move {});
+                        completed = true;
                         miniquad::window::quit();
                         return;
                     }
@@ -872,6 +910,10 @@ impl EventHandler for Stage {
             {
                 let _z = telemetry::ZoneGuard::new("Event::draw end_frame");
                 get_context().end_frame();
+            }
+            if completed {
+                get_context().finish_resource_disposal();
+                self.resources_closed = true;
             }
             get_context().frame_time = date::now() - get_context().last_frame_time;
             get_context().last_frame_time = date::now();
@@ -939,7 +981,7 @@ impl EventHandler for Stage {
             miniquad::window::cancel_quit();
             get_context().quit_requested = true;
         } else {
-            self.shutdown();
+            self.shutdown(true);
         }
     }
 }
@@ -1042,6 +1084,7 @@ impl Window {
             crate::experimental::scene::initialize(crate::time::get_time());
 
             Box::new(Stage {
+                resources_closed: false,
                 main_future: Box::pin(async {
                     future.await;
                     crate::experimental::scene::shutdown();

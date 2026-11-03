@@ -1,4 +1,10 @@
-use crate::{get_context, get_quad_context, math::Rect, texture::Image, Color};
+use crate::{
+    get_quad_context,
+    math::Rect,
+    resource_disposal::DisposalSender,
+    texture::{Image, TextureDisposal},
+    Color,
+};
 
 use std::collections::HashMap;
 
@@ -13,6 +19,7 @@ pub enum SpriteKey {
     Id(u64),
 }
 pub struct Atlas {
+    disposal: DisposalSender<TextureDisposal>,
     texture: miniquad::TextureId,
     image: Image,
     pub sprites: HashMap<SpriteKey, Sprite>,
@@ -29,8 +36,7 @@ pub struct Atlas {
 
 impl Drop for Atlas {
     fn drop(&mut self) {
-        let ctx = &mut get_context().quad_context;
-        ctx.delete_texture(self.texture);
+        self.disposal.send(TextureDisposal::Raw(self.texture));
     }
 }
 
@@ -40,7 +46,11 @@ impl Atlas {
     // well..
     const UNIQUENESS_OFFSET: u64 = 100000;
 
-    pub fn new(ctx: &mut dyn miniquad::RenderingBackend, filter: miniquad::FilterMode) -> Atlas {
+    pub fn new(
+        ctx: &mut dyn miniquad::RenderingBackend,
+        filter: miniquad::FilterMode,
+        disposal: DisposalSender<TextureDisposal>,
+    ) -> Atlas {
         let image = Image::gen_image_color(512, 512, Color::new(0.0, 0.0, 0.0, 0.0));
         let texture = ctx.new_texture_from_rgba8(image.width, image.height, &image.bytes);
         ctx.texture_set_filter(
@@ -50,6 +60,7 @@ impl Atlas {
         );
 
         Atlas {
+            disposal,
             image,
             texture,
             cursor_x: 0,
@@ -101,13 +112,15 @@ impl Atlas {
             self.dirty = false;
             let (texture_width, texture_height) = ctx.texture_size(self.texture);
             if texture_width != self.image.width as _ || texture_height != self.image.height as _ {
-                ctx.delete_texture(self.texture);
-
-                self.texture = ctx.new_texture_from_rgba8(
+                let replacement = ctx.new_texture_from_rgba8(
                     self.image.width,
                     self.image.height,
                     &self.image.bytes[..],
                 );
+                // Queue only after successful allocation, so unwinding cannot
+                // enqueue the old texture twice. Draws may still sample it.
+                let previous = std::mem::replace(&mut self.texture, replacement);
+                self.disposal.send(TextureDisposal::Raw(previous));
                 ctx.texture_set_filter(self.texture, self.filter, miniquad::MipmapFilterMode::None);
             }
 
@@ -235,6 +248,7 @@ mod tests {
 
         Atlas {
             texture,
+            disposal: crate::resource_disposal::DisposalQueue::new().sender(),
             image: Image::gen_image_color(width, height, Color::new(0.0, 0.0, 0.0, 0.0)),
             sprites: HashMap::new(),
             cursor_x: 0,
@@ -275,8 +289,6 @@ mod tests {
             atlas.get(SpriteKey::Id(2)).map(|sprite| sprite.rect),
             Some(Rect::new(2.0, 14.0, 39.0, 10.0))
         );
-
-        std::mem::forget(atlas);
     }
 
     // The row-fit predicate must reject the out-of-bounds one-pixel case
@@ -284,8 +296,7 @@ mod tests {
     // edge. Its left-side GAP is already accounted for in `x`.
     #[test]
     fn sprite_ending_at_row_edge_stays_in_current_line() {
-        let mut storage = std::mem::ManuallyDrop::new(atlas(64, 1024));
-        let atlas = &mut *storage;
+        let mut atlas = atlas(64, 1024);
 
         atlas.cache_sprite(SpriteKey::Id(1), sprite(20, 10, WHITE));
         // x = 24 + GAP = 26, and x + width == 64 exactly.
@@ -338,8 +349,6 @@ mod tests {
         assert_eq!(atlas.image.get_pixel(45, 0), red);
         assert_eq!(atlas.image.get_pixel(2, 0), green);
         assert_eq!(atlas.image.get_pixel(69, 0), blue);
-
-        std::mem::forget(atlas);
     }
 
     // Equal-size sprites must not inherit the randomized `HashMap` drain
@@ -393,7 +402,6 @@ mod tests {
         for _ in 0..7 {
             let mut other = atlas(64, 32);
             assert_eq!(first, pack(&mut other));
-            std::mem::forget(other);
         }
 
         // and the layout is the exact deterministic packing: two grows to
@@ -414,7 +422,5 @@ mod tests {
         );
         // each key still owns its own pixels after the double repack
         assert_eq!(pixels, [blue, red, green, white]);
-
-        std::mem::forget(first_atlas);
     }
 }

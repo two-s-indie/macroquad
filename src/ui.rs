@@ -647,12 +647,32 @@ impl InputHandler for Ui {
 }
 
 impl Ui {
+    /// Creates a UI using the active Macroquad session's backend and disposal
+    /// queue. `ctx` must belong to that session.
     pub fn new(
         ctx: &mut dyn miniquad::RenderingBackend,
         screen_width: f32,
         screen_height: f32,
     ) -> Ui {
-        let atlas = Arc::new(Mutex::new(Atlas::new(ctx, miniquad::FilterMode::Nearest)));
+        Self::new_with_disposal(
+            ctx,
+            screen_width,
+            screen_height,
+            crate::get_context().textures.disposal(),
+        )
+    }
+
+    fn new_with_disposal(
+        ctx: &mut dyn miniquad::RenderingBackend,
+        screen_width: f32,
+        screen_height: f32,
+        disposal: crate::resource_disposal::DisposalSender<crate::texture::TextureDisposal>,
+    ) -> Ui {
+        let atlas = Arc::new(Mutex::new(Atlas::new(
+            ctx,
+            miniquad::FilterMode::Nearest,
+            disposal,
+        )));
         let font =
             crate::text::Font::load_from_bytes(atlas.clone(), include_bytes!("ProggyClean.ttf"))
                 .unwrap();
@@ -1214,8 +1234,9 @@ pub(crate) mod ui_context {
             ctx: &mut dyn miniquad::RenderingBackend,
             screen_width: f32,
             screen_height: f32,
+            disposal: crate::resource_disposal::DisposalSender<crate::texture::TextureDisposal>,
         ) -> UiContext {
-            let ui = megaui::Ui::new(ctx, screen_width, screen_height);
+            let ui = megaui::Ui::new_with_disposal(ctx, screen_width, screen_height, disposal);
 
             UiContext {
                 ui: Rc::new(RefCell::new(ui)),

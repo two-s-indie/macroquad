@@ -12,6 +12,15 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Make the `Map::tiles` return lifetime explicit, removing the tiled crate's
+  `mismatched_lifetime_syntaxes` warning without changing behavior.
+- Complete step 5 of the context safety plan: texture, render-pass, material,
+  and font-atlas destructors enqueue disposal without borrowing the context or
+  calling the backend. Queues belong to their original session and close at
+  shutdown, making late drops harmless. Preserve queued material/attachment
+  lifetimes and defer atlas deletion until queued text finishes. Add tests for
+  nested disposal, exact-once queueing, session isolation, and late drops after
+  completion/accepted quit. The four `CONTEXT` warnings remain for later steps.
 - Complete step 4 of the context safety plan: pass backend and texture lookup
   data explicitly through frame rendering, shapes/models, textures, text,
   UI materials/atlases, and telemetry capture. Resolve camera inputs before

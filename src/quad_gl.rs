@@ -564,6 +564,7 @@ impl PipelinesStorage {
 }
 
 pub struct QuadGl {
+    disposal: crate::resource_disposal::DisposalQueue<GlPipeline>,
     pipelines: PipelinesStorage,
     retired_pipelines: Vec<GlPipeline>,
 
@@ -590,6 +591,7 @@ impl QuadGl {
         let white_texture = ctx.new_texture_from_rgba8(1, 1, &[255, 255, 255, 255]);
 
         QuadGl {
+            disposal: crate::resource_disposal::DisposalQueue::new(),
             pipelines: PipelinesStorage::new(ctx),
             retired_pipelines: Vec::new(),
             state: GlState {
@@ -912,6 +914,9 @@ impl QuadGl {
     }
 
     pub fn geometry(&mut self, vertices: &[Vertex], indices: &[u16]) {
+        // A dropped active material stops affecting subsequent geometry, while
+        // the pipeline remains alive for draws that have already been queued.
+        self.retire_disposed_pipelines();
         if vertices.len() >= self.max_vertices || indices.len() >= self.max_indices {
             warn!("geometry() exceeded max drawcall size, clamping");
         }
@@ -1007,6 +1012,7 @@ impl QuadGl {
     }
 
     fn collect_retired_pipelines(&mut self, ctx: &mut dyn RenderingBackend) {
+        self.retire_disposed_pipelines();
         let draw_calls = &self.draw_calls[..self.draw_calls_count];
         let pipelines = &mut self.pipelines;
         self.retired_pipelines.retain(|pipeline| {
@@ -1016,6 +1022,26 @@ impl QuadGl {
             pipelines.delete_pipeline(ctx, *pipeline);
             false
         });
+    }
+
+    pub(crate) fn disposal_sender(&self) -> crate::resource_disposal::DisposalSender<GlPipeline> {
+        self.disposal.sender()
+    }
+
+    fn retire_disposed_pipelines(&mut self) {
+        for pipeline in self.disposal.take() {
+            self.delete_pipeline(pipeline);
+        }
+    }
+
+    pub(crate) fn close_disposal(&self) {
+        self.disposal.close();
+    }
+
+    pub(crate) fn finish_disposal(&mut self, ctx: &mut dyn RenderingBackend) {
+        self.reset();
+        self.collect_retired_pipelines(ctx);
+        self.close_disposal();
     }
 
     pub fn set_uniform<T>(&mut self, pipeline: GlPipeline, name: &str, uniform: T) {

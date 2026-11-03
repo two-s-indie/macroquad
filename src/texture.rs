@@ -6,33 +6,40 @@ use crate::{
 
 pub use crate::quad_gl::FilterMode;
 use crate::quad_gl::{DrawMode, Vertex};
+use crate::resource_disposal::{DisposalQueue, DisposalSender};
 use glam::{vec2, Vec2};
 use slotmap::{TextureIdSlotMap, TextureSlotId};
 use std::sync::Arc;
 
 mod slotmap;
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct TextureSlotGuarded(
     pub TextureSlotId,
     // Keep render-pass attachments alive while a texture handle exists and
     // let the pass guard arrange their deletion exactly once.
     Option<Arc<RenderPassGuarded>>,
+    DisposalSender<TextureDisposal>,
 );
 
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum TextureHandle {
     // texture that belongs to macroquad and follows normal garbage collection rules
     Managed(Arc<TextureSlotGuarded>),
-    ManagedWeak(TextureSlotId),
+    ManagedWeak(TextureSlotId, DisposalSender<TextureDisposal>),
     // raw miniquad texture, there are no guarantees that this texture is not yet deleted
     Unmanaged(miniquad::TextureId),
 }
 
 pub(crate) struct TexturesContext {
     textures: TextureIdSlotMap,
-    removed: Vec<(TextureSlotId, bool)>,
-    removed_render_passes: Vec<(miniquad::RenderPass, Vec<miniquad::TextureId>)>,
+    disposal: DisposalQueue<TextureDisposal>,
+}
+
+pub(crate) enum TextureDisposal {
+    Managed(TextureSlotId, bool),
+    RenderPass(miniquad::RenderPass, Vec<miniquad::TextureId>),
+    Raw(miniquad::TextureId),
 }
 impl TexturesContext {
     pub(crate) fn resolve(
@@ -42,31 +49,32 @@ impl TexturesContext {
     ) -> miniquad::TextureId {
         match handle {
             TextureHandle::Unmanaged(texture) => *texture,
-            TextureHandle::Managed(texture) => self.texture(texture.0).unwrap_or(fallback),
-            TextureHandle::ManagedWeak(texture) => self.texture(*texture).unwrap_or(fallback),
+            TextureHandle::Managed(texture) if self.disposal.owns(&texture.2) => {
+                self.texture(texture.0).unwrap_or(fallback)
+            }
+            TextureHandle::ManagedWeak(texture, owner) if self.disposal.owns(owner) => {
+                self.texture(*texture).unwrap_or(fallback)
+            }
+            _ => fallback,
         }
     }
     pub fn new() -> TexturesContext {
         TexturesContext {
             textures: TextureIdSlotMap::new(),
-            removed: Vec::with_capacity(200),
-            removed_render_passes: Vec::with_capacity(10),
+            disposal: DisposalQueue::new(),
         }
     }
-    fn schedule_removed(&mut self, texture: TextureSlotId, delete_texture: bool) {
-        self.removed.push((texture, delete_texture));
+    pub(crate) fn disposal(&self) -> DisposalSender<TextureDisposal> {
+        self.disposal.sender()
     }
-    fn schedule_render_pass_removed(
-        &mut self,
-        pass: miniquad::RenderPass,
-        textures: Vec<miniquad::TextureId>,
-    ) {
-        self.removed_render_passes.push((pass, textures));
+    pub(crate) fn close_disposal(&self) {
+        self.disposal.close();
     }
     fn store_texture(&mut self, texture: miniquad::TextureId) -> TextureHandle {
         TextureHandle::Managed(Arc::new(TextureSlotGuarded(
             self.textures.insert(texture),
             None,
+            self.disposal.sender(),
         )))
     }
     fn store_render_target_texture(
@@ -77,6 +85,7 @@ impl TexturesContext {
         TextureHandle::Managed(Arc::new(TextureSlotGuarded(
             self.textures.insert(texture),
             Some(pass),
+            self.disposal.sender(),
         )))
     }
     pub fn texture(&self, texture: TextureSlotId) -> Option<miniquad::TextureId> {
@@ -89,21 +98,30 @@ impl TexturesContext {
         self.textures.len()
     }
     pub fn garbage_collect(&mut self, ctx: &mut miniquad::Context) {
+        let pending = self.disposal.take();
         // Delete RenderPasses first, then textures (safer for attachments/FBOs)
-        for (pass, textures) in self.removed_render_passes.drain(0..) {
-            ctx.delete_render_pass(pass);
-            for texture in textures {
-                ctx.delete_texture(texture);
+        for disposal in &pending {
+            if let TextureDisposal::RenderPass(pass, textures) = disposal {
+                ctx.delete_render_pass(*pass);
+                for texture in textures {
+                    ctx.delete_texture(*texture);
+                }
             }
         }
 
-        for (texture, delete_texture) in self.removed.drain(0..) {
-            if delete_texture {
-                if let Some(texture) = self.textures.get(texture) {
-                    ctx.delete_texture(texture);
+        for disposal in pending {
+            match disposal {
+                TextureDisposal::Managed(texture, delete_texture) => {
+                    if delete_texture {
+                        if let Some(texture) = self.textures.get(texture) {
+                            ctx.delete_texture(texture);
+                        }
+                    }
+                    self.textures.remove(texture);
                 }
+                TextureDisposal::Raw(texture) => ctx.delete_texture(texture),
+                TextureDisposal::RenderPass(..) => {}
             }
-            self.textures.remove(texture);
         }
     }
 }
@@ -396,13 +414,18 @@ pub struct RenderPass {
 }
 
 #[derive(Debug, PartialEq)]
-pub(crate) struct RenderPassGuarded(miniquad::RenderPass, Vec<miniquad::TextureId>);
+pub(crate) struct RenderPassGuarded(
+    miniquad::RenderPass,
+    Vec<miniquad::TextureId>,
+    DisposalSender<TextureDisposal>,
+);
 
 impl Drop for RenderPassGuarded {
     fn drop(&mut self) {
-        get_context()
-            .textures
-            .schedule_render_pass_removed(self.0, std::mem::take(&mut self.1));
+        self.2.send(TextureDisposal::RenderPass(
+            self.0,
+            std::mem::take(&mut self.1),
+        ));
     }
 }
 
@@ -506,7 +529,11 @@ pub fn render_target_ex(width: u32, height: u32, params: RenderTargetParams) -> 
             owned_attachments.push(texture);
         }
     }
-    let render_pass = Arc::new(RenderPassGuarded(render_pass, owned_attachments));
+    let render_pass = Arc::new(RenderPassGuarded(
+        render_pass,
+        owned_attachments,
+        context.textures.disposal(),
+    ));
     let texture = Texture2D {
         texture: context
             .textures
@@ -706,8 +733,8 @@ pub struct Texture2D {
 
 impl Drop for TextureSlotGuarded {
     fn drop(&mut self) {
-        let ctx = get_context();
-        ctx.textures.schedule_removed(self.0, self.1.is_none());
+        self.2
+            .send(TextureDisposal::Managed(self.0, self.1.is_none()));
     }
 }
 
@@ -716,10 +743,10 @@ impl Texture2D {
         match &self.texture {
             TextureHandle::Unmanaged(id) => Texture2D::unmanaged(*id),
             TextureHandle::Managed(t) => Texture2D {
-                texture: TextureHandle::ManagedWeak(t.0),
+                texture: TextureHandle::ManagedWeak(t.0, t.2.clone()),
             },
-            TextureHandle::ManagedWeak(t) => Texture2D {
-                texture: TextureHandle::ManagedWeak(*t),
+            TextureHandle::ManagedWeak(t, owner) => Texture2D {
+                texture: TextureHandle::ManagedWeak(*t, owner.clone()),
             },
         }
     }
@@ -991,10 +1018,13 @@ pub(crate) struct Batcher {
 }
 
 impl Batcher {
-    pub fn new(ctx: &mut dyn miniquad::RenderingBackend) -> Batcher {
+    pub fn new(
+        ctx: &mut dyn miniquad::RenderingBackend,
+        disposal: DisposalSender<TextureDisposal>,
+    ) -> Batcher {
         Batcher {
             unbatched: vec![],
-            atlas: crate::text::atlas::Atlas::new(ctx, miniquad::FilterMode::Linear),
+            atlas: crate::text::atlas::Atlas::new(ctx, miniquad::FilterMode::Linear, disposal),
         }
     }
 
@@ -1045,8 +1075,9 @@ pub fn build_textures_atlas() {
 /// There fore resetting the atlas will render all fonts unusable.
 pub unsafe fn reset_textures_atlas() {
     let context = get_context();
-    context.fonts_storage = crate::text::FontsStorage::new(&mut *context.quad_context);
-    context.texture_batcher = Batcher::new(&mut *context.quad_context);
+    context.fonts_storage =
+        crate::text::FontsStorage::new(&mut *context.quad_context, context.textures.disposal());
+    context.texture_batcher = Batcher::new(&mut *context.quad_context, context.textures.disposal());
 }
 
 pub fn set_default_filter_mode(filter: FilterMode) {
@@ -1057,4 +1088,51 @@ pub fn set_default_filter_mode(filter: FilterMode) {
         .texture_batcher
         .atlas
         .set_filter_with(&mut *context.quad_context, filter);
+}
+
+#[cfg(test)]
+mod disposal_tests {
+    use super::*;
+
+    fn raw(id: u32) -> miniquad::TextureId {
+        miniquad::TextureId::from_raw_id(miniquad::RawId::OpenGl(id))
+    }
+
+    #[test]
+    fn final_texture_owner_enqueues_once_without_a_global_context() {
+        let mut textures = TexturesContext::new();
+        let texture = Texture2D {
+            texture: textures.store_texture(raw(1)),
+        };
+        let clone = texture.clone();
+        let weak = texture.weak_clone();
+        drop(texture);
+        assert!(textures.disposal.take().is_empty());
+        drop(clone);
+        let requests = textures.disposal.take();
+        assert!(matches!(
+            requests.as_slice(),
+            [TextureDisposal::Managed(_, true)]
+        ));
+        drop(weak);
+        assert!(textures.disposal.take().is_empty());
+    }
+
+    #[test]
+    fn old_strong_and_weak_handles_do_not_alias_reused_session_slots() {
+        let mut old = TexturesContext::new();
+        let texture = Texture2D {
+            texture: old.store_texture(raw(1)),
+        };
+        let weak = texture.weak_clone();
+        let mut new = TexturesContext::new();
+        let current = new.store_texture(raw(2));
+        assert_eq!(new.resolve(&texture.texture, raw(0)), raw(0));
+        assert_eq!(new.resolve(&weak.texture, raw(0)), raw(0));
+        drop(old);
+        drop(texture);
+        drop(weak);
+        assert!(new.disposal.take().is_empty());
+        assert_eq!(new.resolve(&current, raw(0)), raw(2));
+    }
 }

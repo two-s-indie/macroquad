@@ -146,9 +146,24 @@ fn rendering_cancellation_completion_and_accepted_quit() {
     assert!(scenario == "completion" || scenario == "quit");
     let events = Events::default();
     let saved = Arc::new(Mutex::new(None));
+    let late_resources = Arc::new(Mutex::new(None));
+    let resources = late_resources.clone();
     let (log, handles) = (events.clone(), saved.clone());
     Window::from_config(config(), async move {
         let (node, target) = install(log.clone());
+        let material = load_material(
+            ShaderSource::Glsl {
+                vertex: "#version 100\nattribute vec3 position; void main() { gl_Position = vec4(position, 1.0); }",
+                fragment: "#version 100\nprecision mediump float; void main() { gl_FragColor = vec4(1.0); }",
+            },
+            MaterialParams::default(),
+        ).unwrap();
+        *resources.lock().unwrap() = Some((
+            Texture2D::from_rgba8(1, 1, &[255; 4]),
+            render_target(2, 2),
+            material,
+            load_ttf_font_from_bytes(include_bytes!("../src/ProggyClean.ttf")).unwrap(),
+        ));
         *handles.lock().unwrap() = Some(node);
         let coroutine = start_coroutine(CancelProbe {
             node,
@@ -175,6 +190,10 @@ fn rendering_cancellation_completion_and_accepted_quit() {
         }
         // Completion or accepted quit cancels the new future before node teardown.
     });
+    // The backend has shut down. Late drops, even from a different thread,
+    // must not reacquire the context or attempt a graphics call.
+    let resources = late_resources.lock().unwrap().take().unwrap();
+    std::thread::spawn(move || drop(resources)).join().unwrap();
     let old = saved.lock().unwrap().unwrap();
     assert!(scene::try_get_node(old).is_none());
     let log = events.lock().unwrap();

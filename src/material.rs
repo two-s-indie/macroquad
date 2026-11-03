@@ -5,11 +5,14 @@ use miniquad::{PipelineParams, UniformDesc};
 use std::sync::Arc;
 
 #[derive(PartialEq)]
-struct GlPipelineGuarded(GlPipeline);
+struct GlPipelineGuarded(
+    GlPipeline,
+    crate::resource_disposal::DisposalSender<GlPipeline>,
+);
 
 impl Drop for GlPipelineGuarded {
     fn drop(&mut self) {
-        get_context().gl.delete_pipeline(self.0);
+        self.1.send(self.0);
     }
 }
 
@@ -145,7 +148,7 @@ pub(crate) fn load_material_with(
     )?;
 
     Ok(Material {
-        pipeline: Arc::new(GlPipelineGuarded(pipeline)),
+        pipeline: Arc::new(GlPipelineGuarded(pipeline, gl.disposal_sender())),
     })
 }
 
