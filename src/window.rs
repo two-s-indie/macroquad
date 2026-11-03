@@ -123,6 +123,7 @@ pub fn set_fullscreen(fullscreen: bool) {
 ///
 /// Without `set_panic_handler` macroquad will not use `catch_unwind` at all,
 /// therefore `panic_handler` is completely optional.
+/// The supplied factory is called after unwinding, outside engine borrows.
 /// NOTE: only with "backtrace" macroquad feature `backtrace` string will contain an
 /// actual backtrace. Otherwise only panic location and message will be available.
 /// NOTE: on android, even with "backtrace" nice backtrace is available only if the game is compiled with sdk >= 21.
@@ -132,6 +133,15 @@ where
     T: std::future::Future<Output = ()> + 'static,
     F: Fn(String, String) -> T + Send + Sync + 'static,
 {
+    let handler: RecoveryHandler =
+        std::sync::Arc::new(move |message, backtrace| Box::pin(future(message, backtrace)));
+    let previous = {
+        let context = crate::get_context();
+        context.unwind = true;
+        context.recovery_handler.replace(handler)
+    };
+    drop(previous);
+    PANIC_INFO.with(|info| *info.borrow_mut() = None);
     std::panic::set_hook(Box::new(move |info| {
         let message = format!("{info:?}");
         #[cfg(feature = "backtrace")]
@@ -141,8 +151,29 @@ where
         crate::logging::error!("{}", message);
         crate::logging::error!("{}", backtrace_string);
 
-        crate::get_context().recovery_future = Some(Box::pin(future(message, backtrace_string)));
+        // The hook can run while a context/scheduler borrow is unwinding.
+        // Record plain data only; invoke the user's factory after catch_unwind.
+        let _ = PANIC_INFO.try_with(|info| {
+            if let Ok(mut info) = info.try_borrow_mut() {
+                *info = Some((message, backtrace_string));
+            }
+        });
     }));
+}
 
-    crate::get_context().unwind = true;
+pub(crate) type RecoveryHandler = std::sync::Arc<
+    dyn Fn(String, String) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>
+        + Send
+        + Sync,
+>;
+
+thread_local! {
+    static PANIC_INFO: std::cell::RefCell<Option<(String, String)>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(crate) fn take_recovery_future(
+) -> Option<std::pin::Pin<Box<dyn std::future::Future<Output = ()>>>> {
+    let handler = crate::get_context().recovery_handler.clone()?;
+    let (message, backtrace) = PANIC_INFO.with(|info| info.borrow_mut().take())?;
+    Some(handler(message, backtrace))
 }

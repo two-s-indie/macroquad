@@ -258,7 +258,7 @@ struct Context {
     camera_stack: Vec<camera::CameraState>,
     texture_batcher: texture::Batcher,
     unwind: bool,
-    recovery_future: Option<Pin<Box<dyn Future<Output = ()>>>>,
+    recovery_handler: Option<window::RecoveryHandler>,
 
     quad_context: Box<dyn miniquad::RenderingBackend>,
 
@@ -404,7 +404,7 @@ impl Context {
             #[cfg(one_screenshot)]
             counter: 0,
             unwind: false,
-            recovery_future: None,
+            recovery_handler: None,
 
             quad_context: ctx,
 
@@ -434,8 +434,6 @@ impl Context {
     fn begin_frame(&mut self) {
         telemetry::begin_gpu_query("GPU");
 
-        self.ui_context.process_input();
-
         let color = Self::DEFAULT_BG_COLOR;
 
         self.quad_context
@@ -458,15 +456,6 @@ impl Context {
 
         self.quad_context.commit_frame();
 
-        #[cfg(one_screenshot)]
-        {
-            get_context().counter += 1;
-            if get_context().counter == 3 {
-                crate::prelude::get_screen_data().export_png("screenshot.png");
-                panic!("screenshot successfully saved to `screenshot.png`");
-            }
-        }
-
         telemetry::end_gpu_query();
 
         self.mouse_wheel = Vec2::new(0., 0.);
@@ -474,7 +463,7 @@ impl Context {
         self.keys_released.clear();
         self.mouse_pressed.clear();
         self.mouse_released.clear();
-        self.last_mouse_position = Some(crate::prelude::mouse_position_local());
+        self.last_mouse_position = Some(self.mouse_position_local());
 
         self.quit_requested = false;
 
@@ -502,6 +491,14 @@ impl Context {
         let dpi = miniquad::window::dpi_scale();
 
         glam::camera::rh::proj::opengl::orthographic(0., width / dpi, height / dpi, 0., -1., 1.)
+    }
+
+    pub(crate) fn mouse_position_local(&self) -> Vec2 {
+        let dpi = miniquad::window::dpi_scale();
+        input::convert_to_local(
+            self.mouse_position / dpi,
+            vec2(self.screen_width, self.screen_height) / dpi,
+        )
     }
 
     pub(crate) fn projection_matrix(&self) -> glam::Mat4 {
@@ -869,6 +866,14 @@ impl EventHandler for Stage {
 
             {
                 let _z = telemetry::ZoneGuard::new("Event::draw begin_frame");
+                let (ui, input) = {
+                    let context = get_context();
+                    (
+                        context.ui_context.ui.clone(),
+                        ui::ui_context::InputSnapshot::take(context, miniquad::window::dpi_scale()),
+                    )
+                };
+                UiContext::process_input(&ui, input);
                 get_context().begin_frame();
             }
 
@@ -893,7 +898,8 @@ impl EventHandler for Stage {
                         miniquad::window::quit();
                         return;
                     }
-                    get_context().coroutines_context.update();
+                    let coroutines = get_context().coroutines_context.clone();
+                    coroutines.update();
                     // Scene callbacks may use timing, cameras, and drawing APIs.
                     // Dispatch outside Context::end_frame's exclusive borrow and
                     // inside the same panic-recovery boundary as other user code.
@@ -902,7 +908,7 @@ impl EventHandler for Stage {
             );
 
             if result == false {
-                if let Some(recovery_future) = get_context().recovery_future.take() {
+                if let Some(recovery_future) = window::take_recovery_future() {
                     self.main_future = recovery_future;
                 }
             }
@@ -910,6 +916,18 @@ impl EventHandler for Stage {
             {
                 let _z = telemetry::ZoneGuard::new("Event::draw end_frame");
                 get_context().end_frame();
+            }
+            #[cfg(one_screenshot)]
+            {
+                let capture = {
+                    let context = get_context();
+                    context.counter += 1;
+                    context.counter == 3
+                };
+                if capture {
+                    crate::prelude::get_screen_data().export_png("screenshot.png");
+                    panic!("screenshot successfully saved to `screenshot.png`");
+                }
             }
             if completed {
                 get_context().finish_resource_disposal();

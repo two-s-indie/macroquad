@@ -1,138 +1,283 @@
 //! The way to emulate multitasking with macroquad's `.await`.
-//! Useful for organizing state machines, animation cutscenes and other stuff that require
-//! some evaluation over time.
-//!
+//! Useful for state machines, animation cutscenes and work spread across frames.
 
 use std::any::{Any, TypeId};
+use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::pin::Pin;
+use std::rc::Rc;
 use std::task::{Context, Poll};
 
 use crate::exec::resume;
 use crate::get_context;
 
 mod generational_storage;
-
+#[cfg(test)]
+mod tests;
 use generational_storage::{GenerationalId, GenerationalStorage};
 
 struct CoroutineInternal {
     future: Pin<Box<dyn Future<Output = Box<dyn Any>>>>,
     manual_poll: bool,
     manual_time: Option<f64>,
-    // if return value of a coroutine is () there is no need to
-    // keep coroutine's memory allocated until the user retrieves the data
-    // we can free the memory right away, and just return () on retrieve
     has_value: bool,
 }
 
 enum CoroutineState {
     Running(CoroutineInternal),
+    // Reserve the identity while the future is owned by the poll guard.
+    Polling {
+        manual_poll: bool,
+        manual_time: Option<f64>,
+    },
     Value(Box<dyn Any>),
-    Nothing,
 }
 
-impl CoroutineState {
-    pub const fn is_value(&self) -> bool {
-        matches!(self, CoroutineState::Value(_))
-    }
-
-    pub const fn is_nothing(&self) -> bool {
-        matches!(self, CoroutineState::Nothing)
-    }
-
-    pub fn take_value(&mut self) -> Option<Box<dyn Any>> {
-        if self.is_value() {
-            let state = std::mem::replace(self, CoroutineState::Nothing);
-            if let CoroutineState::Value(v) = state {
-                return Some(v);
-            }
-        }
-
-        None
-    }
-}
-
-pub(crate) struct CoroutinesContext {
+struct Scheduler {
     coroutines: GenerationalStorage<CoroutineState>,
-    active_coroutine_now: Option<f64>,
-    active_coroutine_delta: Option<f64>,
+    active_delta: Option<f64>,
+    updating: bool,
+}
+
+#[derive(Clone)]
+pub(crate) struct CoroutinesContext(Rc<RefCell<Scheduler>>);
+
+fn context() -> CoroutinesContext {
+    get_context().coroutines_context.clone()
 }
 
 impl CoroutinesContext {
-    pub fn new() -> CoroutinesContext {
-        CoroutinesContext {
+    pub fn new() -> Self {
+        Self(Rc::new(RefCell::new(Scheduler {
             coroutines: GenerationalStorage::new(),
-            active_coroutine_now: None,
-            active_coroutine_delta: None,
+            active_delta: None,
+            updating: false,
+        })))
+    }
+
+    fn start<T: 'static + Any>(&self, future: impl Future<Output = T> + 'static) -> Coroutine<T> {
+        let coroutine = CoroutineState::Running(CoroutineInternal {
+            future: Box::pin(async { Box::new(future.await) as _ }),
+            has_value: TypeId::of::<()>() != TypeId::of::<T>(),
+            manual_poll: false,
+            manual_time: None,
+        });
+        let id = self.0.borrow_mut().coroutines.push(coroutine);
+        Coroutine {
+            id,
+            _phantom: PhantomData,
         }
     }
 
-    pub fn update(&mut self) {
-        self.coroutines.retain(|coroutine| {
-            if let CoroutineState::Running(ref mut f) = coroutine {
-                if f.manual_poll == false {
-                    if let Some(v) = resume(&mut f.future) {
-                        if f.has_value {
-                            *coroutine = CoroutineState::Value(v);
-                        } else {
-                            return false;
-                        }
+    pub fn update(&self) {
+        struct Updating {
+            scheduler: CoroutinesContext,
+        }
+        impl Drop for Updating {
+            fn drop(&mut self) {
+                self.scheduler.0.borrow_mut().updating = false;
+            }
+        }
+        let ids = {
+            let mut scheduler = self.0.borrow_mut();
+            assert!(!scheduler.updating, "recursive coroutine update");
+            scheduler.updating = true;
+            scheduler.coroutines.ids()
+        };
+        let _updating = Updating {
+            scheduler: self.clone(),
+        };
+        for id in ids {
+            self.poll(id, None);
+        }
+    }
+
+    fn is_done(&self, id: GenerationalId) -> bool {
+        matches!(
+            self.0.borrow().coroutines.get(id),
+            None | Some(CoroutineState::Value(_))
+        )
+    }
+
+    fn retrieve<T: 'static + Any>(&self, id: GenerationalId) -> Option<T> {
+        if TypeId::of::<T>() == TypeId::of::<()>() && self.is_done(id) {
+            return Some(*Box::<dyn Any>::from(Box::new(())).downcast::<T>().unwrap());
+        }
+        let removed = {
+            let mut scheduler = self.0.borrow_mut();
+            if matches!(scheduler.coroutines.get(id), Some(CoroutineState::Value(_))) {
+                scheduler.coroutines.take(id)
+            } else {
+                None
+            }
+        };
+        match removed {
+            Some(CoroutineState::Value(value)) => Some(*value.downcast().unwrap()),
+            _ => None,
+        }
+    }
+
+    fn set_manual_poll(&self, id: GenerationalId) {
+        let mut scheduler = self.0.borrow_mut();
+        match scheduler.coroutines.get_mut(id) {
+            Some(CoroutineState::Running(f)) => {
+                f.manual_poll = true;
+                f.manual_time = Some(0.);
+            }
+            Some(CoroutineState::Polling {
+                manual_poll,
+                manual_time,
+            }) => {
+                *manual_poll = true;
+                *manual_time = Some(0.);
+            }
+            _ => {}
+        }
+    }
+
+    fn poll(&self, id: GenerationalId, delta: Option<f64>) {
+        let (future, previous_delta) = {
+            let mut scheduler = self.0.borrow_mut();
+            let Some(slot) = scheduler.coroutines.get_mut(id) else {
+                return;
+            };
+            match slot {
+                CoroutineState::Value(_) => return,
+                CoroutineState::Polling { .. } => {
+                    assert!(delta.is_none(), "coroutine is already being polled");
+                    return;
+                }
+                CoroutineState::Running(f) => {
+                    if delta.is_none() && f.manual_poll {
+                        return;
+                    }
+                    if delta.is_some() {
+                        assert!(
+                            f.manual_poll,
+                            "coroutine requires set_manual_poll before poll"
+                        );
                     }
                 }
             }
+            let CoroutineState::Running(f) = slot else {
+                unreachable!()
+            };
+            let manual_poll = f.manual_poll;
+            let manual_time = f.manual_time.map(|time| time + delta.unwrap_or(0.));
+            let CoroutineState::Running(future) = std::mem::replace(
+                slot,
+                CoroutineState::Polling {
+                    manual_poll,
+                    manual_time,
+                },
+            ) else {
+                unreachable!()
+            };
+            let previous_delta = std::mem::replace(&mut scheduler.active_delta, delta);
+            (future, previous_delta)
+        };
+        let mut guard = PollGuard {
+            context: self.clone(),
+            id,
+            previous_delta,
+            future: Some(future),
+            active: true,
+        };
+        let result = resume(&mut guard.future.as_mut().unwrap().future);
+        guard.finish(result);
+    }
 
-            true
-        });
+    fn stop(&self, id: GenerationalId) {
+        let removed = self.0.borrow_mut().coroutines.take(id);
+        drop(removed);
+    }
+
+    fn stop_all(&self) {
+        let removed = self.0.borrow_mut().coroutines.take_all();
+        drop(removed);
+    }
+
+    fn active_delta(&self) -> Option<f64> {
+        self.0.borrow().active_delta
     }
 
     pub(crate) fn allocated_memory(&self) -> usize {
-        self.coroutines.allocated_memory()
+        self.0.borrow().coroutines.allocated_memory()
     }
-
     pub(crate) fn active_coroutines_count(&self) -> usize {
-        self.coroutines.count()
+        self.0.borrow().coroutines.count()
     }
 }
+
+struct PollGuard {
+    context: CoroutinesContext,
+    id: GenerationalId,
+    previous_delta: Option<f64>,
+    future: Option<CoroutineInternal>,
+    active: bool,
+}
+impl PollGuard {
+    fn finish(mut self, result: Option<Box<dyn Any>>) {
+        let completed = result.is_some();
+        let has_value = self.future.as_ref().unwrap().has_value;
+        let mut next = if completed {
+            result.map(CoroutineState::Value)
+        } else {
+            self.future.take().map(CoroutineState::Running)
+        };
+        {
+            let mut scheduler = self.context.0.borrow_mut();
+            scheduler.active_delta = self.previous_delta;
+            if let Some(CoroutineState::Polling {
+                manual_poll,
+                manual_time,
+            }) = scheduler.coroutines.get_mut(self.id)
+            {
+                if let Some(CoroutineState::Running(f)) = &mut next {
+                    f.manual_poll = *manual_poll;
+                    f.manual_time = *manual_time;
+                }
+                if completed && !has_value {
+                    // This is only a placeholder; it owns no user data.
+                    scheduler.coroutines.take(self.id);
+                } else {
+                    *scheduler.coroutines.get_mut(self.id).unwrap() = next.take().unwrap();
+                }
+            }
+        }
+        self.active = false;
+        // A cancelled poll's result and remaining future storage are dropped
+        // after restoring timing and releasing the scheduler borrow.
+        drop(next);
+    }
+}
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        if self.active {
+            let removed = {
+                let mut scheduler = self.context.0.borrow_mut();
+                scheduler.active_delta = self.previous_delta;
+                scheduler.coroutines.take(self.id)
+            };
+            drop(removed);
+        }
+        // self.future is dropped after this method, outside the scheduler borrow.
+    }
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct Coroutine<T = ()> {
     id: GenerationalId,
     _phantom: PhantomData<T>,
 }
-
 impl<T: 'static + Any> Coroutine<T> {
-    /// Returns true if the coroutine finished or was stopped.
+    /// Returns true if the coroutine finished, panicked, or was stopped.
     pub fn is_done(&self) -> bool {
-        let context = &get_context().coroutines_context;
-
-        let coroutine = context.coroutines.get(self.id);
-
-        if let Some(coroutine) = coroutine {
-            return coroutine.is_value() || coroutine.is_nothing();
-        }
-
-        return true;
+        context().is_done(self.id)
     }
-
     pub fn retrieve(&self) -> Option<T> {
-        let context = &mut get_context().coroutines_context;
-
-        // () is a special case. Futures with () as a return type do not keep
-        // their state after finish, so just return ()
-        if self.is_done() && TypeId::of::<()>() == TypeId::of::<T>() {
-            // well, I wish tehre was a better way to do this..
-            let res = Box::new(()) as Box<dyn Any>;
-            return Some(*res.downcast().unwrap());
-        }
-
-        let coroutine = context.coroutines.get_mut(self.id);
-        if let Some(v) = coroutine.and_then(|c| c.take_value()) {
-            let res = Some(*v.downcast().unwrap());
-            context.coroutines.free(self.id);
-            return res;
-        }
-
-        None
+        context().retrieve(self.id)
     }
 
     /// By default coroutines are being polled each frame, inside the "next_frame()"
@@ -160,99 +305,46 @@ impl<T: 'static + Any> Coroutine<T> {
     /// after set_manual_poll() coroutine will never be polled automatically
     /// so player will need to poll all its coroutines inside "update" function
     pub fn set_manual_poll(&mut self) {
-        let context = &mut get_context().coroutines_context;
-
-        if let Some(CoroutineState::Running(coroutine)) = context.coroutines.get_mut(self.id) {
-            coroutine.manual_time = Some(0.);
-            coroutine.manual_poll = true;
-        }
+        context().set_manual_poll(self.id);
     }
 
-    /// Poll coroutine once and advance coroutine's timeline by `delta_time`
-    /// Things like `wait_for_seconds` will wait for time in this local timeline`
-    /// Will panic if coroutine.manual_poll == false
+    /// Poll once and advance the local timeline by `delta_time`.
+    /// Panics unless manual polling was enabled, or if this coroutine is already
+    /// being polled. A panic from its future cancels that coroutine.
     pub fn poll(&mut self, delta_time: f64) {
-        let context = &mut get_context().coroutines_context;
-
-        let coroutine = context.coroutines.get_mut(self.id);
-
-        // coroutine was finished already
-        if coroutine.is_none() {
-            return;
-        }
-
-        let coroutine = coroutine.unwrap();
-        if let CoroutineState::Running(f) = coroutine {
-            context.active_coroutine_now = f.manual_time;
-            context.active_coroutine_delta = Some(delta_time);
-            *f.manual_time.as_mut().unwrap() += delta_time;
-            if let Some(v) = resume(&mut f.future) {
-                if f.has_value {
-                    *coroutine = CoroutineState::Value(v);
-                } else {
-                    context.coroutines.free(self.id);
-                }
-            }
-            context.active_coroutine_now = None;
-            context.active_coroutine_delta = None;
-        }
+        context().poll(self.id, Some(delta_time));
     }
 }
 
+/// Schedule a coroutine. Coroutines started during an automatic update become
+/// eligible on the next update; manual polling may run them immediately.
 pub fn start_coroutine<T: 'static + Any>(
     future: impl Future<Output = T> + 'static + Send,
 ) -> Coroutine<T> {
-    let context = &mut get_context().coroutines_context;
-
-    let has_value = TypeId::of::<()>() != TypeId::of::<T>();
-
-    let id = context
-        .coroutines
-        .push(CoroutineState::Running(CoroutineInternal {
-            future: Box::pin(async { Box::new(future.await) as _ }),
-            has_value,
-            manual_poll: false,
-            manual_time: None,
-        }));
-
-    Coroutine {
-        id,
-        _phantom: PhantomData,
-    }
+    context().start(future)
 }
 
-/// Cancel the currently registered coroutines. Destructors run after detaching
-/// that snapshot; coroutines they create remain scheduled.
+/// Cancel the current snapshot. Destructors run outside scheduler/context
+/// borrows; coroutines they create remain scheduled. A currently polling future
+/// finishes its current poll before its storage is destroyed.
 pub fn stop_all_coroutines() {
-    let removed = get_context().coroutines_context.coroutines.take_all();
-    // Futures can access the scene or schedule/cancel coroutines in Drop.
-    // Release our context access before running their destructors.
-    drop(removed);
+    context().stop_all();
 }
 
 pub fn stop_coroutine<T: 'static + Any>(coroutine: Coroutine<T>) {
-    let removed = get_context()
-        .coroutines_context
-        .coroutines
-        .take(coroutine.id);
-    drop(removed);
+    context().stop(coroutine.id);
 }
 
 pub struct TimerDelayFuture {
     pub(crate) remaining_time: f32,
 }
-
 impl Future for TimerDelayFuture {
     type Output = Option<()>;
-
     fn poll(mut self: Pin<&mut Self>, _: &mut Context) -> Poll<Self::Output> {
-        let delta = get_context()
-            .coroutines_context
-            .active_coroutine_delta
-            .unwrap_or(crate::time::get_frame_time() as _);
-
+        let delta = context()
+            .active_delta()
+            .unwrap_or_else(|| crate::time::get_frame_time() as _);
         self.remaining_time -= delta as f32;
-
         if self.remaining_time <= 0.0 {
             Poll::Ready(Some(()))
         } else {
@@ -260,7 +352,6 @@ impl Future for TimerDelayFuture {
         }
     }
 }
-
 pub const fn wait_seconds(time: f32) -> TimerDelayFuture {
     TimerDelayFuture {
         remaining_time: time,

@@ -12,8 +12,8 @@ mod tests {
     fn freeing_a_handle_twice_does_not_duplicate_a_free_slot() {
         let mut storage = GenerationalStorage::new();
         let old = storage.push(1);
-        storage.free(old);
-        storage.free(old);
+        let _ = storage.take(old);
+        let _ = storage.take(old);
 
         let first = storage.push(2);
         let second = storage.push(3);
@@ -30,7 +30,7 @@ mod tests {
 
         assert!(storage.get(old).is_none());
         assert!(storage.get_mut(old).is_none());
-        storage.free(old);
+        let _ = storage.take(old);
         assert_eq!(storage.count(), 0);
     }
 
@@ -38,7 +38,7 @@ mod tests {
     fn clearing_does_not_revive_old_handles_when_slots_are_reused() {
         let mut storage = GenerationalStorage::new();
         let old = [storage.push(1), storage.push(2), storage.push(3)];
-        storage.free(old[1]);
+        let _ = storage.take(old[1]);
         drop(storage.take_all());
         drop(storage.take_all());
 
@@ -46,7 +46,7 @@ mod tests {
         for id in old {
             assert!(storage.get(id).is_none());
             assert!(storage.get_mut(id).is_none());
-            storage.free(id);
+            let _ = storage.take(id);
         }
         for (id, value) in current.into_iter().zip(4..=6) {
             assert_eq!(storage.get(id), Some(&value));
@@ -58,12 +58,12 @@ mod tests {
     fn freeing_a_completed_handle_does_not_duplicate_a_free_slot() {
         let mut storage = GenerationalStorage::new();
         let completed = storage.push(1);
-        storage.retain(|_| false);
-        storage.free(completed);
+        let _ = storage.take(completed);
+        let _ = storage.take(completed);
 
         let first = storage.push(2);
         let second = storage.push(3);
-        storage.free(completed);
+        let _ = storage.take(completed);
         assert_eq!(storage.get(first), Some(&2));
         assert_eq!(storage.get(second), Some(&3));
     }
@@ -129,30 +129,21 @@ impl<T> GenerationalStorage<T> {
         Some(&mut cell.state)
     }
 
-    /// Retains only the elements specified by the predicate, passing a mutable reference to it.
-    /// In other words, remove all elements e such that f(&mut e) returns false. This method operates in place, visiting each element exactly once in the original order, and preserves the order of the retained elements.
-    pub fn retain<F>(&mut self, mut f: F)
-    where
-        F: FnMut(&mut T) -> bool,
-    {
-        for (id, cell) in self.vec.iter_mut().enumerate() {
-            if cell.is_none() {
-                continue;
-            }
-
-            let c = cell.as_mut().unwrap();
-            let pred = f(&mut c.state);
-            let old_generation = c.generation;
-
-            if !pred {
-                self.free_indices.push((id, old_generation));
-                *cell = None;
-            }
-        }
-    }
-
     pub fn count(&self) -> usize {
         self.vec.iter().filter(|c| c.is_some()).count()
+    }
+
+    pub fn ids(&self) -> Vec<GenerationalId> {
+        self.vec
+            .iter()
+            .enumerate()
+            .filter_map(|(id, cell)| {
+                cell.as_ref().map(|cell| GenerationalId {
+                    id,
+                    generation: cell.generation,
+                })
+            })
+            .collect()
     }
 
     /// Detach values without running their destructors under the caller's borrow.
@@ -165,10 +156,6 @@ impl<T> GenerationalStorage<T> {
             }
         }
         removed
-    }
-
-    pub fn free(&mut self, id: GenerationalId) {
-        drop(self.take(id));
     }
 
     pub fn take(&mut self, id: GenerationalId) -> Option<T> {

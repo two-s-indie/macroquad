@@ -2,8 +2,6 @@
 
 use std::collections::HashSet;
 
-use crate::prelude::screen_height;
-use crate::prelude::screen_width;
 use crate::Vec2;
 use crate::{get_context, DroppedFile};
 pub use miniquad::{KeyCode, MouseButton};
@@ -62,16 +60,14 @@ pub fn mouse_position() -> (f32, f32) {
 
 /// Return mouse position in range [-1; 1].
 pub fn mouse_position_local() -> Vec2 {
-    let (pixels_x, pixels_y) = mouse_position();
-
-    convert_to_local(Vec2::new(pixels_x, pixels_y))
+    get_context().mouse_position_local()
 }
 
 /// Returns the difference between the current mouse position and the mouse position on the previous frame.
 pub fn mouse_delta_position() -> Vec2 {
     let context = get_context();
 
-    let current_position = mouse_position_local();
+    let current_position = context.mouse_position_local();
     let last_position = context.last_mouse_position.unwrap_or(current_position);
 
     // Calculate the delta
@@ -97,12 +93,15 @@ pub fn touches() -> Vec<Touch> {
 
 /// Return touches with positions in range [-1; 1].
 pub fn touches_local() -> Vec<Touch> {
-    get_context()
+    let context = get_context();
+    let size =
+        Vec2::new(context.screen_width, context.screen_height) / miniquad::window::dpi_scale();
+    context
         .touches
         .values()
         .map(|touch| {
             let mut touch = touch.clone();
-            touch.position = convert_to_local(touch.position);
+            touch.position = convert_to_local(touch.position, size);
             touch
         })
         .collect()
@@ -149,12 +148,6 @@ pub fn get_char_pressed() -> Option<char> {
     let context = get_context();
 
     context.chars_pressed_queue.pop_front()
-}
-
-pub(crate) fn get_char_pressed_ui() -> Option<char> {
-    let context = get_context();
-
-    context.chars_pressed_ui_queue.pop_front()
 }
 
 /// Return the last pressed key.
@@ -210,9 +203,8 @@ pub fn is_mouse_button_released(btn: MouseButton) -> bool {
 }
 
 /// Convert a position in pixels to a position in the range [-1; 1].
-fn convert_to_local(pixel_pos: Vec2) -> Vec2 {
-    Vec2::new(pixel_pos.x / screen_width(), pixel_pos.y / screen_height()) * 2.0
-        - Vec2::new(1.0, 1.0)
+pub(crate) fn convert_to_local(pixel_pos: Vec2, screen_size: Vec2) -> Vec2 {
+    (pixel_pos / screen_size) * 2.0 - Vec2::new(1.0, 1.0)
 }
 
 /// Prevents quit
@@ -246,12 +238,34 @@ pub mod utils {
     }
 
     /// Repeats all events that came since last call of this function with current value of `subscriber`. This function must be called at each frame.
+    /// Callbacks run outside the context borrow. Events added during replay are
+    /// left for a later call. If a callback panics, undelivered events remain
+    /// queued; the event whose callback panicked is not repeated.
     pub fn repeat_all_miniquad_input<T: miniquad::EventHandler>(t: &mut T, subscriber: usize) {
-        let context = get_context();
-
-        for event in &context.input_events[subscriber] {
+        struct Replay {
+            subscriber: usize,
+            events: std::vec::IntoIter<crate::MiniquadInputEvent>,
+        }
+        impl Drop for Replay {
+            fn drop(&mut self) {
+                if self.events.len() == 0 {
+                    return;
+                }
+                // Keep undelivered events ahead of any events appended by a
+                // callback. Never replay the event whose callback panicked.
+                let mut remaining: Vec<_> = self.events.by_ref().collect();
+                let context = get_context();
+                remaining.append(&mut context.input_events[self.subscriber]);
+                context.input_events[self.subscriber] = remaining;
+            }
+        }
+        let events = std::mem::take(&mut get_context().input_events[subscriber]);
+        let mut replay = Replay {
+            subscriber,
+            events: events.into_iter(),
+        };
+        while let Some(event) = replay.events.next() {
             event.repeat(t);
         }
-        context.input_events[subscriber].clear();
     }
 }

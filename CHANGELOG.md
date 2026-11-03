@@ -12,6 +12,15 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 6 of the context safety plan: poll coroutine futures outside
+  context/scheduler borrows, preserve cancellation and nested manual timing,
+  and cancel panicking coroutines without leaving scheduler state stuck.
+  Coroutines created during automatic polling become eligible next update.
+  Process UI input snapshots and replay callbacks outside context borrows;
+  preserve undelivered input after callback panics. Invoke panic recovery
+  factories after unwinding and move the third-frame screenshot diagnostic
+  outside the frame borrow. Add headless and real-backend regression coverage;
+  the four `CONTEXT` warnings remain for later steps.
 - Make the `Map::tiles` return lifetime explicit, removing the tiled crate's
   `mismatched_lifetime_syntaxes` warning without changing behavior.
 - Complete step 5 of the context safety plan: texture, render-pass, material,

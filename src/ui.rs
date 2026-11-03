@@ -1223,6 +1223,51 @@ pub(crate) mod ui_context {
     use std::cell::RefCell;
     use std::rc::Rc;
 
+    pub(crate) struct InputSnapshot {
+        mouse_position: (f32, f32),
+        mouse_pressed: bool,
+        mouse_released: bool,
+        shift: bool,
+        ctrl: bool,
+        chars: std::collections::VecDeque<char>,
+        keys: Vec<megaui::KeyCode>,
+        wheel: Vec2,
+    }
+
+    impl InputSnapshot {
+        pub(crate) fn take(context: &mut crate::Context, dpi: f32) -> Self {
+            let down = |key| context.keys_down.contains(&key);
+            let pressed = |key| context.keys_pressed.contains(&key);
+            let shift = down(KeyCode::LeftShift) || down(KeyCode::RightShift);
+            let ctrl = down(KeyCode::LeftControl) || down(KeyCode::RightControl);
+            let mut keys = Vec::new();
+            macro_rules! collect_keys {
+                ($($key:ident),*) => { $(
+                    if pressed(KeyCode::$key) || down(KeyCode::$key) { keys.push(megaui::KeyCode::$key); }
+                )* };
+            }
+            collect_keys!(
+                Up, Down, Right, Left, Home, End, Delete, Backspace, Tab, Z, Y, C, X, V, A, Escape,
+                Enter
+            );
+            if ctrl || pressed(KeyCode::LeftControl) || pressed(KeyCode::RightControl) {
+                keys.push(megaui::KeyCode::Control);
+            }
+            Self {
+                mouse_position: (
+                    context.mouse_position.x / dpi,
+                    context.mouse_position.y / dpi,
+                ),
+                mouse_pressed: context.mouse_pressed.contains(&MouseButton::Left),
+                mouse_released: context.mouse_released.contains(&MouseButton::Left),
+                shift,
+                ctrl,
+                keys,
+                chars: std::mem::take(&mut context.chars_pressed_ui_queue),
+                wheel: context.mouse_wheel,
+            }
+        }
+    }
     pub(crate) struct UiContext {
         pub ui: Rc<RefCell<megaui::Ui>>,
         ui_draw_list: Vec<megaui::DrawList>,
@@ -1245,67 +1290,26 @@ pub(crate) mod ui_context {
             }
         }
 
-        pub(crate) fn process_input(&mut self) {
+        pub(crate) fn process_input(ui: &Rc<RefCell<megaui::Ui>>, input: InputSnapshot) {
             use megaui::InputHandler;
-
-            let mouse_position = mouse_position();
-
-            let mut ui = self.ui.borrow_mut();
-            ui.mouse_move(mouse_position);
-
-            if is_mouse_button_pressed(MouseButton::Left) {
-                ui.mouse_down(mouse_position);
+            let mut ui = ui.borrow_mut();
+            ui.mouse_move(input.mouse_position);
+            if input.mouse_pressed {
+                ui.mouse_down(input.mouse_position);
             }
-            if is_mouse_button_released(MouseButton::Left) {
-                ui.mouse_up(mouse_position);
+            if input.mouse_released {
+                ui.mouse_up(input.mouse_position);
             }
-
-            let shift = is_key_down(KeyCode::LeftShift) || is_key_down(KeyCode::RightShift);
-            let ctrl = is_key_down(KeyCode::LeftControl) || is_key_down(KeyCode::RightControl);
-
-            while let Some(c) = get_char_pressed_ui() {
-                if ctrl == false {
+            for c in input.chars {
+                if !input.ctrl {
                     ui.char_event(c, false, false);
                 }
             }
-
-            macro_rules! process {
-                ($code:tt) => {
-                    if is_key_pressed(KeyCode::$code) || is_key_down(KeyCode::$code) {
-                        ui.key_down(megaui::KeyCode::$code, shift, ctrl);
-                    }
-                };
+            for key in input.keys {
+                ui.key_down(key, input.shift, input.ctrl);
             }
-
-            process!(Up);
-            process!(Down);
-            process!(Right);
-            process!(Left);
-            process!(Home);
-            process!(End);
-            process!(Delete);
-            process!(Backspace);
-            process!(Tab);
-            process!(Z);
-            process!(Y);
-            process!(C);
-            process!(X);
-            process!(V);
-            process!(A);
-            process!(Escape);
-            process!(Enter);
-
-            if is_key_down(KeyCode::LeftControl)
-                || is_key_down(KeyCode::RightControl)
-                || is_key_pressed(KeyCode::LeftControl)
-                || is_key_pressed(KeyCode::RightControl)
-            {
-                ui.key_down(megaui::KeyCode::Control, shift, ctrl);
-            }
-            let (wheel_x, wheel_y) = mouse_wheel();
-            ui.mouse_wheel(wheel_x, -wheel_y);
+            ui.mouse_wheel(input.wheel.x, -input.wheel.y);
         }
-
         pub(crate) fn draw(
             &mut self,
             ctx: &mut dyn miniquad::RenderingBackend,

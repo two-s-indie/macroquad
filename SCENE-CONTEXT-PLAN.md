@@ -4,7 +4,7 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 5 are complete. `SCENE` now uses scoped thread-local storage;
+Steps 1 through 6 are complete. `SCENE` now uses scoped thread-local storage;
 its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
 The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
 The overall engine/context migration is not yet complete.
@@ -260,20 +260,56 @@ Graphics ran on Windows/OpenGL; Metal and Miri were not executed.
 ### 6 Move callbacks and future polling outside context borrows
 
 - [x] Invoke scene updates outside any whole-context borrow (moved in step 3).
-- [ ] Refactor coroutine scheduling so polling a future holds neither the whole
+- [x] Refactor coroutine scheduling so polling a future holds neither the whole
   context nor an exclusive scheduler borrow that callbacks need to reacquire.
-- [ ] Preserve coroutine insertion, cancellation, completion, and manual timing
+- [x] Preserve coroutine insertion, cancellation, completion, and manual timing
   semantics while callbacks create or stop coroutines.
-- [ ] Gather input/timing snapshots before UI processing, and pass the required
+- [x] Gather input/timing snapshots before UI processing, and pass the required
   data into internal UI functions instead of reading globals mid-borrow.
-- [ ] Review panic recovery and future destruction. Restore bookkeeping on
+- [x] Review panic recovery and future destruction. Restore bookkeeping on
   unwind without holding a context borrow while user values are dropped.
-- [ ] Move the `one_screenshot` diagnostic's screenshot operation outside the
+- [x] Move the `one_screenshot` diagnostic's screenshot operation outside the
   context borrow used to increment/check its frame counter.
 
 Acceptance: coroutine and scene callbacks can use drawing, input, timing, and
 resource APIs without nested whole-context access. Existing coroutine tests,
 panic recovery, and the screenshot configuration remain functional.
+
+Outcome: the context owns an independently shared `Rc<RefCell>` scheduler.
+Polling detaches the future while retaining a generational placeholder; no
+context or scheduler borrow crosses a poll or disposal of detached user data.
+Cancellation removes the placeholder immediately and discards a still-polling
+future/result after its poll finishes. Slot reuse cannot restore an old future
+over a new one. RAII restores nested manual deltas and update flags on unwind;
+a panicking coroutine is cancelled. Async locals can still drop inside their
+poll, with its timing active, but can reenter the scheduler and engine.
+
+Automatic updates snapshot identities in slot order. Tasks created during an
+update wait for the next update; explicit manual polls can run immediately.
+Recursive polling of the same future is rejected. Existing main-before-coroutine
+ordering, manual pause/delay, typed results, repeated unit retrieval, and
+cancellation-destructor insertion behavior remain. Public signatures are unchanged.
+
+UI processing receives mouse/key/character/wheel snapshots and an independently
+owned UI reference. Frame cleanup and local mouse/touch conversion use existing
+context data without nested getters. Input replay detaches its event snapshot;
+callbacks can register subscribers/reenter engine APIs. Unwind preserves
+undelivered events ahead of newly queued events without redelivering the failing
+event. The panic hook records plain thread-local data; the recovery factory runs
+after catch/unwind and outside engine borrows. `one_screenshot` still exports
+the third frame and intentionally panics, after the frame borrow ends.
+
+Validation: 74 library tests pass, including eight new scheduler regressions.
+All five existing pause/value coroutine cases pass in separate processes, as
+required by Miniquad's native display lifecycle. The delayed-coroutine,
+rendering, scene lifecycle, and new coroutine/panic-recovery graphics tests pass.
+A Windows test verifies subscriber growth, nested replay, callback unwind, and
+UI click delivery using synthetic messages to its own window. The screenshot
+configuration runs in a child process and verifies the third frame's PNG pixels
+and intentional panic. Native build, all-target checking, WebAssembly library
+checking, formatting, and whitespace checks pass; four `CONTEXT` warnings remain.
+Metal, Miri, and the broader interactive DPI/IME suite were not run. Escaping
+UI/GL guards and full context/session teardown remain steps 7/8.
 
 ### 7 Resolve APIs that return references or guards
 
