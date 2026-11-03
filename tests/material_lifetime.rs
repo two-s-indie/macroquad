@@ -51,7 +51,7 @@ async fn dropped_materials_finish_queued_draws() {
     let owned = material("vec4(1.0)");
     gl_use_material(&owned);
     draw_rectangle(0.0, 0.0, 1.0, 1.0, WHITE);
-    unsafe { get_internal_gl().flush() };
+    with_internal_gl(|mut gl| gl.flush());
     // OpenGL keeps the currently bound program alive until another is bound,
     // so its delete status directly verifies that the material released it.
     unsafe {
@@ -61,14 +61,14 @@ async fn dropped_materials_finish_queued_draws() {
         miniquad::gl::glGetIntegerv(GL_CURRENT_PROGRAM, &mut program);
         assert_ne!(program, 0);
         drop(owned);
-        get_internal_gl().flush();
+        with_internal_gl(|mut gl| gl.flush());
         let mut deleted = 0;
         miniquad::gl::glGetProgramiv(program as u32, GL_DELETE_STATUS, &mut deleted);
         assert_eq!(miniquad::gl::glGetError(), miniquad::gl::GL_NO_ERROR);
         assert_eq!(deleted, 1);
     }
     draw_rectangle(0.0, 0.0, 1.0, 1.0, WHITE);
-    unsafe { get_internal_gl().flush() };
+    with_internal_gl(|mut gl| gl.flush());
 
     // Materials without pending draws can reuse storage within the same frame.
     for _ in 0..100 {

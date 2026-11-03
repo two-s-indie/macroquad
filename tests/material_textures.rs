@@ -54,6 +54,7 @@ async fn nested_render_target_disposal_waits_for_queued_draws() {
     drop(material);
     // Retiring the pipeline releases its texture and then its render-pass
     // guard, all while the renderer/backend are borrowed during the flush.
+    with_internal_gl(|mut gl| gl.flush());
     set_default_camera();
     assert_eq!(
         destination.texture.get_texture_data().get_pixel(0, 0),

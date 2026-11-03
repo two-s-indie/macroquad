@@ -697,13 +697,9 @@ impl QuadGl {
         self.clear_draw_calls();
     }
 
-    pub fn draw(&mut self, ctx: &mut dyn miniquad::RenderingBackend, projection: glam::Mat4) {
-        // Legacy low-level entry point. Engine rendering uses explicit lookup;
-        // migration of externally held GL access belongs to step 7.
-        self.draw_with_texture_lookup(ctx, projection, Texture2D::raw_miniquad_id);
-    }
-
-    pub(crate) fn draw_with_texture_lookup(
+    /// Submit queued draws using an explicit texture resolver. Engine plugins
+    /// should normally use `InternalGlContext::flush` instead.
+    pub fn draw(
         &mut self,
         ctx: &mut dyn miniquad::RenderingBackend,
         projection: glam::Mat4,
@@ -841,14 +837,6 @@ impl QuadGl {
         self.state.capture = capture;
     }
 
-    pub fn get_projection_matrix(&self) -> glam::Mat4 {
-        // get_projection_matrix is a way plugins used to get macroquad's current projection
-        // back in the days when projection was a part of static batcher
-        // now it is not, so here we go with this hack
-
-        crate::get_context().projection_matrix()
-    }
-
     pub const fn get_active_render_pass(&self) -> Option<RenderPass> {
         self.state.render_pass
     }
@@ -865,11 +853,9 @@ impl QuadGl {
         self.state.depth_test_enable = enable;
     }
 
-    pub fn texture(&mut self, texture: Option<&Texture2D>) {
-        self.texture_raw(texture.map(Texture2D::raw_miniquad_id));
-    }
-
-    pub(crate) fn texture_raw(&mut self, texture: Option<miniquad::TextureId>) {
+    /// Select a backend texture ID. Use `InternalGlContext::texture` for a
+    /// Macroquad `Texture2D`; keep its owner alive until queued drawing finishes.
+    pub fn texture(&mut self, texture: Option<miniquad::TextureId>) {
         self.state.texture = texture;
     }
 
@@ -881,13 +867,11 @@ impl QuadGl {
         self.state.viewport = viewport;
     }
 
-    pub fn get_viewport(&self) -> (i32, i32, i32, i32) {
-        self.state.viewport.unwrap_or((
-            0,
-            0,
-            crate::window::screen_width() as _,
-            crate::window::screen_height() as _,
-        ))
+    /// Current viewport, with an explicit logical screen size as the fallback.
+    pub fn get_viewport(&self, screen_size: (f32, f32)) -> (i32, i32, i32, i32) {
+        self.state
+            .viewport
+            .unwrap_or((0, 0, screen_size.0 as _, screen_size.1 as _))
     }
 
     pub fn push_model_matrix(&mut self, matrix: glam::Mat4) {

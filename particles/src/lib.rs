@@ -293,7 +293,7 @@ impl ParticleShape {
         &self,
         ctx: &mut dyn miniquad::RenderingBackend,
         positions_vertex_buffer: BufferId,
-        texture: Option<Texture2D>,
+        texture: Option<miniquad::TextureId>,
     ) -> Bindings {
         let (geometry_vertex_buffer, index_buffer) = match self {
             ParticleShape::Rectangle { aspect_ratio } => {
@@ -372,10 +372,9 @@ impl ParticleShape {
         Bindings {
             vertex_buffers: vec![geometry_vertex_buffer, positions_vertex_buffer],
             index_buffer,
-            images: vec![texture.map_or_else(
-                || ctx.new_texture_from_rgba8(1, 1, &[255, 255, 255, 255]),
-                |texture| texture.raw_miniquad_id(),
-            )],
+            images: vec![
+                texture.unwrap_or_else(|| ctx.new_texture_from_rgba8(1, 1, &[255, 255, 255, 255]))
+            ],
         }
     }
 }
@@ -536,9 +535,15 @@ impl Emitter {
     const MAX_PARTICLES: usize = 10000;
 
     pub fn new(config: EmitterConfig) -> Emitter {
-        let InternalGlContext {
-            quad_context: ctx, ..
-        } = unsafe { get_internal_gl() };
+        with_internal_gl(|gl| Self::new_with_gl(config, gl))
+    }
+
+    fn new_with_gl(config: EmitterConfig, gl: InternalGlContext<'_>) -> Emitter {
+        let texture = config
+            .texture
+            .as_ref()
+            .map(|texture| gl.texture_id(texture));
+        let ctx = gl.quad_context;
 
         // empty, dynamic instance-data vertex buffer
         let positions_vertex_buffer = ctx.new_buffer(
@@ -547,10 +552,9 @@ impl Emitter {
             BufferSource::empty::<GpuParticle>(Self::MAX_PARTICLES),
         );
 
-        let bindings =
-            config
-                .shape
-                .build_bindings(ctx, positions_vertex_buffer, config.texture.clone());
+        let bindings = config
+            .shape
+            .build_bindings(ctx, positions_vertex_buffer, texture);
 
         let (vertex, fragment) = config.material.as_ref().map_or_else(
             || (shader::VERTEX, shader::FRAGMENT),
@@ -783,13 +787,18 @@ impl Emitter {
         });
     }
 
-    fn update(&mut self, ctx: &mut dyn miniquad::RenderingBackend, dt: f32) {
+    fn update(&mut self, gl: &mut InternalGlContext<'_>, dt: f32) {
+        let texture = self
+            .config
+            .texture
+            .as_ref()
+            .map(|texture| gl.texture_id(texture));
+        let ctx = &mut *gl.quad_context;
         if self.mesh_dirty {
-            self.bindings = self.config.shape.build_bindings(
-                ctx,
-                self.bindings.vertex_buffers[1],
-                self.config.texture.clone(),
-            );
+            self.bindings =
+                self.config
+                    .shape
+                    .build_bindings(ctx, self.bindings.vertex_buffers[1], texture);
             self.mesh_dirty = false;
         }
         if self.config.emitting {
@@ -911,10 +920,12 @@ impl Emitter {
         }
     }
 
-    fn perform_render_pass(&mut self, quad_gl: &QuadGl, ctx: &mut dyn miniquad::RenderingBackend) {
+    fn perform_render_pass(&mut self, gl: &mut InternalGlContext<'_>) {
+        let projection = gl.get_projection_matrix();
+        let ctx = &mut *gl.quad_context;
         ctx.apply_bindings(&self.bindings);
         ctx.apply_uniforms(UniformsSource::table(&shader::Uniforms {
-            mvp: quad_gl.get_projection_matrix(),
+            mvp: projection,
             emitter_position: vec3(self.position.x, self.position.y, 0.0),
             local_coords: if self.config.local_coords { 1.0 } else { 0.0 },
         }));
@@ -956,7 +967,10 @@ impl Emitter {
         ctx.apply_pipeline(&self.pipeline);
     }
 
-    pub fn end_render_pass(&mut self, quad_gl: &QuadGl, ctx: &mut dyn miniquad::RenderingBackend) {
+    pub fn end_render_pass(&mut self, gl: &mut InternalGlContext<'_>) {
+        let viewport = gl.get_viewport();
+        let quad_gl = &*gl.quad_gl;
+        let ctx = &mut *gl.quad_context;
         ctx.end_render_pass();
 
         if self.config.post_processing.is_some() {
@@ -968,7 +982,7 @@ impl Emitter {
             }
 
             ctx.apply_pipeline(&self.post_processing_pipeline);
-            let (x, y, w, h) = quad_gl.get_viewport();
+            let (x, y, w, h) = viewport;
             ctx.apply_viewport(x, y, w, h);
 
             ctx.apply_bindings(&self.post_processing_bindings);
@@ -980,22 +994,15 @@ impl Emitter {
     }
 
     pub fn draw(&mut self, pos: Vec2) {
-        let mut gl = unsafe { get_internal_gl() };
-
-        gl.flush();
-
-        let InternalGlContext {
-            quad_context: ctx,
-            quad_gl,
-        } = gl;
-
-        self.position = pos;
-
-        self.update(ctx, get_frame_time());
-
-        self.setup_render_pass(quad_gl, ctx);
-        self.perform_render_pass(quad_gl, ctx);
-        self.end_render_pass(quad_gl, ctx);
+        let dt = get_frame_time();
+        with_internal_gl(|mut gl| {
+            gl.flush();
+            self.position = pos;
+            self.update(&mut gl, dt);
+            self.setup_render_pass(gl.quad_gl, gl.quad_context);
+            self.perform_render_pass(&mut gl);
+            self.end_render_pass(&mut gl);
+        });
     }
 }
 
@@ -1044,36 +1051,32 @@ impl EmittersCache {
     }
 
     pub fn draw(&mut self) {
-        let mut gl = unsafe { get_internal_gl() };
+        let dt = get_frame_time();
+        with_internal_gl(|mut gl| {
+            gl.flush();
 
-        gl.flush();
+            if self.active_emitters.len() > 0 {
+                self.emitter.setup_render_pass(gl.quad_gl, gl.quad_context);
+            }
+            for i in &mut self.active_emitters {
+                if let Some((emitter, pos)) = i {
+                    emitter.position = *pos;
 
-        let InternalGlContext {
-            quad_context: ctx,
-            quad_gl,
-        } = gl;
+                    emitter.update(&mut gl, dt);
 
-        if self.active_emitters.len() > 0 {
-            self.emitter.setup_render_pass(quad_gl, ctx);
-        }
-        for i in &mut self.active_emitters {
-            if let Some((emitter, pos)) = i {
-                emitter.position = *pos;
+                    emitter.perform_render_pass(&mut gl);
 
-                emitter.update(ctx, get_frame_time());
-
-                emitter.perform_render_pass(quad_gl, ctx);
-
-                if emitter.config.emitting == false {
-                    self.emitters_cache.push(i.take().unwrap().0);
+                    if emitter.config.emitting == false {
+                        self.emitters_cache.push(i.take().unwrap().0);
+                    }
                 }
             }
-        }
-        if self.active_emitters.len() > 0 {
-            self.emitter.end_render_pass(quad_gl, ctx);
-        }
+            if self.active_emitters.len() > 0 {
+                self.emitter.end_render_pass(&mut gl);
+            }
 
-        self.active_emitters.retain(|emitter| emitter.is_some())
+            self.active_emitters.retain(|emitter| emitter.is_some());
+        });
     }
 }
 

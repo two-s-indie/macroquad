@@ -2,13 +2,7 @@ use macroquad::prelude::*;
 
 #[macroquad::main("Raw miniquad")]
 async fn main() {
-    let stage = {
-        let InternalGlContext {
-            quad_context: ctx, ..
-        } = unsafe { get_internal_gl() };
-
-        raw_miniquad::Stage::new(ctx)
-    };
+    let stage = with_internal_gl(|gl| raw_miniquad::Stage::new(gl.quad_context));
 
     loop {
         clear_background(LIGHTGRAY);
@@ -23,13 +17,10 @@ async fn main() {
         draw_rectangle(-0.3, 0.3, 0.2, 0.2, GREEN);
         draw_circle(0., 0., 0.1, YELLOW);
 
-        {
-            let mut gl = unsafe { get_internal_gl() };
-
+        let t = get_time();
+        with_internal_gl(|mut gl| {
             // Ensure that macroquad's shapes are not going to be lost
             gl.flush();
-
-            let t = get_time();
 
             gl.quad_context.apply_pipeline(&stage.pipeline);
 
@@ -49,7 +40,7 @@ async fn main() {
                 gl.quad_context.draw(0, 6, 1);
             }
             gl.quad_context.end_render_pass();
-        }
+        });
 
         // Back to screen space, render some text
 

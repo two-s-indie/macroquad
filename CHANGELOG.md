@@ -12,6 +12,12 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Fixed
 
+- Complete step 7 of the context safety plan: root UI guards retain independent
+  storage, reject conflicting access, and release correctly on unwind. Scoped
+  GL access prevents escaping renderer/backend references and rejects engine
+  reentry; flush, texture lookup, projection, and viewport access use explicit
+  data. Add ownership, compile-fail, and real-backend UI/GL/particle regressions.
+  The four `CONTEXT` warnings remain for step 8.
 - Complete step 6 of the context safety plan: poll coroutine futures outside
   context/scheduler borrows, preserve cancellation and nested manual timing,
   and cancel panicking coroutines without leaving scheduler state stuck.
@@ -83,6 +89,14 @@ this changelog's scope. Dates below are commit dates, not release dates.
 
 ### Changed
 
+- Replace unsafe `get_internal_gl()` with `with_internal_gl(|mut gl| { ... })`.
+  Migrate low-level examples, particles, and graphics tests. Projection and
+  texture/viewport convenience access now belongs to `InternalGlContext`;
+  standalone `QuadGl` operations take explicit IDs, screen size, and a texture
+  resolver. `Ui::new` takes width/height and uses the active session; GL scopes
+  can use `gl.new_ui`. Particle `end_render_pass` takes scoped GL access.
+  See [step 7's migration table](SCENE-CONTEXT-PLAN.md#7-resolve-apis-that-return-references-or-guards).
+  No affected calls were found in the sibling game.
 - Nodes created during scene callbacks now begin callbacks next frame, with
   `ready()` before update/fixed/draw. A guard blocking ready also blocks later
   callbacks that frame. Clearing still preserves persistent nodes; session

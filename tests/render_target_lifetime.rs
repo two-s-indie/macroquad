@@ -4,13 +4,7 @@ use macroquad::prelude::*;
 async fn render_target_texture_outlives_its_target() {
     for sample_count in [1, 4] {
         if sample_count > 1
-            && !unsafe {
-                get_internal_gl()
-                    .quad_context
-                    .info()
-                    .features
-                    .resolve_attachments
-            }
+            && !with_internal_gl(|gl| gl.quad_context.info().features.resolve_attachments)
         {
             continue;
         }

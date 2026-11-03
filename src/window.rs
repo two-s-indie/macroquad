@@ -4,7 +4,7 @@ use crate::get_context;
 
 use crate::color::Color;
 
-// miniquad is re-exported for the use in combination with `get_internal_gl`
+// miniquad is re-exported for use with `with_internal_gl`.
 pub use miniquad;
 
 pub use miniquad::conf::Conf;
@@ -33,26 +33,123 @@ pub fn gl_set_drawcall_buffer_capacity(max_vertices: usize, max_indices: usize) 
         .update_drawcall_capacity(&mut *context.quad_context, max_vertices, max_indices);
 }
 
+/// Scoped renderer/backend access supplied by [`with_internal_gl`].
+/// Use these fields and methods inside the closure; engine globals are unavailable.
 pub struct InternalGlContext<'a> {
     pub quad_context: &'a mut dyn miniquad::RenderingBackend,
     pub quad_gl: &'a mut crate::quad_gl::QuadGl,
+    textures: &'a crate::texture::TexturesContext,
+    projection: glam::Mat4,
+    screen_size: (f32, f32),
 }
 
 impl<'a> InternalGlContext<'a> {
-    /// Draw all the batched stuff and reset the internal state cache.
-    /// May be helpful for combining macroquad's drawing with raw miniquad/opengl calls.
+    /// Submit batched Macroquad geometry using this scope's projection and
+    /// texture registry. Call before drawing with raw Miniquad/OpenGL commands.
     pub fn flush(&mut self) {
-        get_context().perform_render_passes();
+        let textures = self.textures;
+        let white_texture = self.quad_gl.white_texture;
+        self.quad_gl
+            .draw(self.quad_context, self.projection, |texture| {
+                textures.resolve(&texture.texture, white_texture)
+            });
+    }
+
+    /// Resolve a texture using this session's registry, without global access.
+    /// The ID does not keep the texture alive; retain its `Texture2D` owner.
+    pub fn texture_id(&self, texture: &crate::texture::Texture2D) -> miniquad::TextureId {
+        self.textures
+            .resolve(&texture.texture, self.quad_gl.white_texture)
+    }
+
+    /// Select a Macroquad texture for subsequent batched geometry.
+    /// Keep its owner alive until queued drawing finishes.
+    pub fn texture(&mut self, texture: Option<&crate::texture::Texture2D>) {
+        let texture = texture.map(|texture| self.texture_id(texture));
+        self.quad_gl.texture(texture);
+    }
+
+    /// Camera projection captured when entering the scope.
+    pub fn get_projection_matrix(&self) -> glam::Mat4 {
+        self.projection
+    }
+
+    /// Current renderer viewport, defaulting to the captured logical screen size.
+    pub fn get_viewport(&self) -> (i32, i32, i32, i32) {
+        self.quad_gl.get_viewport(self.screen_size)
+    }
+
+    /// Create a separate UI backed by this engine session.
+    pub fn new_ui(&mut self, width: f32, height: f32) -> crate::ui::Ui {
+        crate::ui::Ui::new_with_disposal(self.quad_context, width, height, self.textures.disposal())
     }
 }
 
-pub unsafe fn get_internal_gl<'a>() -> InternalGlContext<'a> {
-    let context = get_context();
+thread_local! {
+    static INTERNAL_GL_ACTIVE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
 
-    InternalGlContext {
+// Temporary boundary until step 8 makes every context borrow scoped. Check this
+// before creating any context/backend reference, not after borrowing the global.
+pub(crate) fn assert_context_available() {
+    INTERNAL_GL_ACTIVE.with(|active| {
+        assert!(
+            !active.get(),
+            "engine context is already borrowed by with_internal_gl; use the supplied GL access"
+        )
+    });
+}
+
+struct InternalGlScope;
+impl Drop for InternalGlScope {
+    fn drop(&mut self) {
+        INTERNAL_GL_ACTIVE.with(|active| active.set(false));
+    }
+}
+
+/// Access the renderer and backend for the duration of a synchronous closure.
+/// Replaces the unsafe, unconstrained references returned by `get_internal_gl`.
+///
+/// Read timing/input and create engine resources before entering. Calls that
+/// access the engine context (including nested `with_internal_gl`, drawing,
+/// camera changes, and `Texture2D` methods) panic inside the closure. Use the
+/// supplied texture/projection/viewport helpers and backend instead. Resource
+/// drops enqueue disposal and are allowed. The boundary is released on unwind.
+/// Call `gl.flush()` before raw rendering to submit pending Macroquad geometry.
+///
+/// ```no_run
+/// use macroquad::prelude::*;
+/// with_internal_gl(|mut gl| {
+///     gl.flush();
+///     gl.quad_context.begin_default_pass(miniquad::PassAction::Nothing);
+///     // Raw backend drawing goes here.
+///     gl.quad_context.end_render_pass();
+/// });
+/// ```
+///
+/// References cannot escape, including into a future:
+/// ```compile_fail
+/// use macroquad::prelude::*;
+/// let backend = with_internal_gl(|gl| gl.quad_context);
+/// ```
+/// ```compile_fail
+/// use macroquad::prelude::*;
+/// let future = with_internal_gl(|mut gl| async move { gl.flush() });
+/// ```
+pub fn with_internal_gl<R>(f: impl FnOnce(InternalGlContext<'_>) -> R) -> R {
+    let context = get_context();
+    INTERNAL_GL_ACTIVE.with(|active| active.set(true));
+    let _scope = InternalGlScope;
+    let projection = context.projection_matrix();
+    let dpi = miniquad::window::dpi_scale();
+    let screen_size = (context.screen_width / dpi, context.screen_height / dpi);
+    f(InternalGlContext {
         quad_context: &mut *context.quad_context,
         quad_gl: &mut context.gl,
-    }
+        textures: &context.textures,
+        projection,
+        screen_size,
+    })
 }
 
 /// Logical client width: framebuffer pixels divided by the current rendering DPI scale.

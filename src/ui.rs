@@ -17,6 +17,7 @@ mod clipboard;
 #[macro_use]
 mod hash;
 mod input_handler;
+mod owned;
 mod render;
 mod style;
 
@@ -39,8 +40,17 @@ use std::{
 
 /// Root UI. Widgets drawn with the root ui will be always presented at the end of the frame with a "default" camera.
 /// UI space would be a "default" screen space (0..screen_width(), 0..screen_height())
+///
+/// The guard owns its UI storage and does not borrow the engine context. Drawing,
+/// input, and other engine APIs can be used while it is held. A second root UI
+/// guard is rejected until this one is dropped, including during frame input and
+/// rendering: release it before `next_frame().await`. Release also works on panic.
+/// A detached guard keeps its old UI alive; it never attaches to a new session.
+/// This preserves CPU storage, not permission to use old GPU resources with a
+/// different session. Like other UI values, the guard stays on its owner thread.
 pub fn root_ui() -> impl DerefMut<Target = Ui> {
-    crate::get_context().ui_context.ui.borrow_mut()
+    let ui = crate::get_context().ui_context.ui.clone();
+    ui.borrow_mut()
 }
 
 /// Current camera world space UI.
@@ -647,22 +657,19 @@ impl InputHandler for Ui {
 }
 
 impl Ui {
-    /// Creates a UI using the active Macroquad session's backend and disposal
-    /// queue. `ctx` must belong to that session.
-    pub fn new(
-        ctx: &mut dyn miniquad::RenderingBackend,
-        screen_width: f32,
-        screen_height: f32,
-    ) -> Ui {
+    /// Creates a separate UI using the active session's backend and disposal
+    /// queue. Inside `with_internal_gl`, use `gl.new_ui(width, height)` instead.
+    pub fn new(screen_width: f32, screen_height: f32) -> Ui {
+        let context = crate::get_context();
         Self::new_with_disposal(
-            ctx,
+            &mut *context.quad_context,
             screen_width,
             screen_height,
-            crate::get_context().textures.disposal(),
+            context.textures.disposal(),
         )
     }
 
-    fn new_with_disposal(
+    pub(crate) fn new_with_disposal(
         ctx: &mut dyn miniquad::RenderingBackend,
         screen_width: f32,
         screen_height: f32,
@@ -1220,8 +1227,7 @@ pub(crate) mod ui_context {
 
     use crate::ui as megaui;
 
-    use std::cell::RefCell;
-    use std::rc::Rc;
+    use super::owned::Owned;
 
     pub(crate) struct InputSnapshot {
         mouse_position: (f32, f32),
@@ -1269,7 +1275,7 @@ pub(crate) mod ui_context {
         }
     }
     pub(crate) struct UiContext {
-        pub ui: Rc<RefCell<megaui::Ui>>,
+        pub ui: Owned<megaui::Ui>,
         ui_draw_list: Vec<megaui::DrawList>,
         material: Option<Material>,
     }
@@ -1284,13 +1290,13 @@ pub(crate) mod ui_context {
             let ui = megaui::Ui::new_with_disposal(ctx, screen_width, screen_height, disposal);
 
             UiContext {
-                ui: Rc::new(RefCell::new(ui)),
+                ui: Owned::new(ui),
                 ui_draw_list: vec![],
                 material: None,
             }
         }
 
-        pub(crate) fn process_input(ui: &Rc<RefCell<megaui::Ui>>, input: InputSnapshot) {
+        pub(crate) fn process_input(ui: &Owned<megaui::Ui>, input: InputSnapshot) {
             use megaui::InputHandler;
             let mut ui = ui.borrow_mut();
             ui.mouse_move(input.mouse_position);
@@ -1357,17 +1363,17 @@ pub(crate) mod ui_context {
 
             let mut atlas = ui.atlas.lock().unwrap();
             let font_texture = atlas.texture_with(ctx);
-            quad_gl.texture_raw(Some(font_texture));
+            quad_gl.texture(Some(font_texture));
 
             material.apply(quad_gl);
 
             for draw_command in &ui_draw_list {
                 if let Some(ref texture) = draw_command.texture {
-                    quad_gl.texture_raw(Some(
+                    quad_gl.texture(Some(
                         textures.resolve(&texture.texture, quad_gl.white_texture),
                     ));
                 } else {
-                    quad_gl.texture_raw(Some(font_texture));
+                    quad_gl.texture(Some(font_texture));
                 }
 
                 quad_gl.scissor(
@@ -1378,7 +1384,7 @@ pub(crate) mod ui_context {
                 quad_gl.draw_mode(DrawMode::Triangles);
                 quad_gl.geometry(&draw_command.vertices[..], &draw_command.indices);
             }
-            quad_gl.texture_raw(None);
+            quad_gl.texture(None);
 
             quad_gl.pipeline(None);
 

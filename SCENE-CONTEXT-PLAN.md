@@ -4,7 +4,7 @@ Fix the remaining mutable-global warnings on the `game` branch by making
 ownership and borrowing explicit. Complete `SCENE` first, then migrate `CONTEXT`
 in small, independently verifiable changes.
 
-Steps 1 through 6 are complete. `SCENE` now uses scoped thread-local storage;
+Steps 1 through 7 are complete. `SCENE` now uses scoped thread-local storage;
 its `static_mut_refs` warning is gone. Four warnings remain, all in `CONTEXT`.
 The `THREAD_ID`, `STORAGE`, and `PROFILER` changes are already implemented.
 The overall engine/context migration is not yet complete.
@@ -313,20 +313,84 @@ UI/GL guards and full context/session teardown remain steps 7/8.
 
 ### 7 Resolve APIs that return references or guards
 
-- [ ] Keep `root_ui()` usable without retaining a whole-context mutable borrow.
+- [x] Keep `root_ui()` usable without retaining a whole-context mutable borrow.
   Use independently owned UI state and a guard with a valid owner/lifetime.
-- [ ] Audit other returned references and guards before removing the old
+- [x] Audit other returned references and guards before removing the old
   accessors; references must not escape a temporary context borrow.
-- [ ] Decide the compatibility strategy for `get_internal_gl()` and
+- [x] Decide the compatibility strategy for `get_internal_gl()` and
   `InternalGlContext`. Prefer a scoped closure or explicit guard; if the existing
   unsafe API is retained, specify and enforce its lifetime/exclusivity boundary
   as far as its signature permits.
-- [ ] Make `InternalGlContext::flush()` operate through its existing access
+- [x] Make `InternalGlContext::flush()` operate through its existing access
   rather than reacquiring the global context.
 
 Acceptance: common UI usage remains valid; low-level GL examples and tests use
 the selected access model. Any public API migration is documented and checked
 against the sibling game before proceeding.
+
+Outcome: `root_ui()` returns an owned exclusive guard. A stable boxed UI moves
+out of an independently shared slot until release; no context/slot borrow spans
+widget calls. The guard retains its original slot, survives owner replacement,
+and restores access on unwind. Conflicting guards fail without losing the UI.
+Ordinary `root_ui().label(...)` and widget closures retain their signatures and
+can use drawing, input, timing, and resources. Guards remain non-`Send` and must
+be released before advancing the frame, as input/rendering also need the UI.
+Keeping CPU storage alive does not authorize GPU use with a different session.
+
+Low-level access now uses `with_internal_gl(|mut gl| { ... })`. Its closure
+receives lifetime-bound backend/renderer references, the texture registry, and
+projection/screen-size snapshots. References cannot escape directly or inside
+a returned future. `flush()` resolves material textures and draws through that
+access. Context/backend getters reject reentry before creating references;
+nested window initialization is also rejected. RAII releases this temporary
+boundary on unwind; it does not roll back raw GPU state. Step 8 will replace
+the underlying global/accessors with scoped storage rather than retain this
+boundary as a substitute for the full migration.
+
+Compatibility: the unsafe `get_internal_gl()` API is removed because its
+caller-chosen lifetime cannot be preserved by the upcoming scoped context.
+Read input/time and create engine resources before entering a GL closure;
+perform normal drawing/camera changes after it returns. Use the supplied
+backend and helpers inside. Resource disposal remains queue-only. Migrated
+raw-Miniquad, custom-material, and tree examples, particle creation/drawing/cache,
+and graphics tests. The sibling game's complete `src/main.rs` and manifest
+were inspected: no affected low-level calls or explicit UI constructors were
+found, so no game source changes are required. The game itself was not run.
+
+| Previous low-level use | Replacement |
+| --- | --- |
+| `unsafe { get_internal_gl() }` | `with_internal_gl(|mut gl| { ... })` |
+| `quad_gl.get_projection_matrix()` | `gl.get_projection_matrix()` |
+| `quad_gl.get_viewport()` | `gl.get_viewport()`; standalone renderers pass screen size explicitly |
+| `quad_gl.texture(Some(&texture))` | `gl.texture(Some(&texture))`; standalone renderers accept backend IDs |
+| `texture.raw_miniquad_id()` inside GL access | `gl.texture_id(&texture)` |
+| `quad_gl.draw(backend, projection)` | `gl.flush()`; standalone renderers supply an explicit texture resolver |
+| `Ui::new(backend, width, height)` | `Ui::new(width, height)` or `gl.new_ui(width, height)` inside GL access |
+| `emitter.end_render_pass(quad_gl, backend)` | `emitter.end_render_pass(&mut gl)` |
+
+Returned-reference audit: UI state (`get_bool`/`get_any`), image pixel slices,
+shader/pipeline helpers, text-editor selections, byte slices, and internal
+generation-store lookups borrow their explicit owners/inputs. Scene/storage
+guards already retain independent owners; scene iterators snapshot identities
+and acquire owned guards. Telemetry returns owned snapshots, and its zone/log
+guards retain no context reference. Font/resource accessors return owned handles
+or backend IDs, which do not extend GPU lifetimes. The hidden `camera_ui()`
+placeholder still only panics. No additional public reference-returning context
+accessor was found. The two private unrestricted getters and context lifecycle
+remain step 8; ordinary test success does not establish their safety.
+
+Validation: 77 library tests pass, including three ownership regressions for
+conflicts/unwind, owner replacement/exact-once destruction, and destructor
+reentry. Three GL documentation checks pass, including rejection of escaping
+backend references and futures. Eight graphics integration binaries pass on
+Windows/OpenGL: context guards, coroutine recovery, input replay, material
+lifetimes/textures, render-target lifetime, rendering context, and scene
+lifecycle (completion and accepted quit in separate child processes). New
+pixel checks cover mixed raw/batched drawing and textured particles/cache;
+post-processing runs with a custom viewport and checks for GL errors. Native
+build, all-target checking, WebAssembly library checking, formatting, and
+whitespace checks pass. Four `CONTEXT` warnings remain. Examples were compiled;
+Metal, Miri, and full game runtime/performance validation were not run.
 
 ### 8 Replace CONTEXT storage and define its lifecycle
 
@@ -375,8 +439,9 @@ those pass. Graphics tests require a working backend; report which tests were
 executed and which were only compiled. Update this plan with outcomes as work
 progresses without marking later steps complete early.
 
-The next implementation task is step 4: remove nested renderer/backend access
-before replacing `CONTEXT`. Four context warnings remain during that preparation.
+The next implementation task is step 8: replace `CONTEXT` and its unrestricted
+accessors, then define and verify full session teardown. Four context warnings
+remain until that migration is complete.
 
 ## Rust reference guidance
 

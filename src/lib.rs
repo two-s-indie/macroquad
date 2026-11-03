@@ -423,7 +423,7 @@ impl Context {
 
     pub(crate) fn set_texture(&mut self, texture: Option<&texture::Texture2D>) {
         let texture = texture.map(|texture| self.raw_miniquad_id(&texture.texture));
-        self.gl.texture_raw(texture);
+        self.gl.texture(texture);
     }
 
     /// Returns the files which have been dropped onto the window.
@@ -518,10 +518,9 @@ impl Context {
     fn draw_with_projection(&mut self, matrix: Mat4) {
         let white_texture = self.gl.white_texture;
         let textures = &self.textures;
-        self.gl
-            .draw_with_texture_lookup(&mut *self.quad_context, matrix, |texture| {
-                textures.resolve(&texture.texture, white_texture)
-            });
+        self.gl.draw(&mut *self.quad_context, matrix, |texture| {
+            textures.resolve(&texture.texture, white_texture)
+        });
     }
 
     fn finish_resource_disposal(&mut self) {
@@ -555,12 +554,14 @@ pub mod test {
 
 fn get_context() -> &'static mut Context {
     thread_assert::same_thread();
+    window::assert_context_available();
 
     unsafe { CONTEXT.as_mut().unwrap_or_else(|| panic!()) }
 }
 
 fn get_quad_context() -> &'static mut dyn miniquad::RenderingBackend {
     thread_assert::same_thread();
+    window::assert_context_available();
 
     unsafe {
         assert!(CONTEXT.is_some());
@@ -1083,6 +1084,7 @@ impl Window {
     }
 
     pub fn from_config(config: impl Into<conf::Conf>, future: impl Future<Output = ()> + 'static) {
+        window::assert_context_available();
         let conf::Conf {
             miniquad_conf,
             update_on,
